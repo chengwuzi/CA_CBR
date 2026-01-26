@@ -11,6 +11,8 @@ from torch.utils.data import Dataset, DataLoader
 
 
 def print_statistics(X, string):
+    if os.environ.get("MULTICBR_QUIET_STATS") == "1":
+        return
     print('>'*10 + string + '>'*10 )
     print('Average interactions', X.sum(1).mean(0).item())
     nonzero_row_indice, nonzero_col_indice = X.nonzero()
@@ -100,9 +102,14 @@ class Datasets():
 
         self.graphs = [u_b_graph_train, u_i_graph, b_i_graph]
 
-        self.train_loader = DataLoader(self.bundle_train_data, batch_size=batch_size_train, shuffle=True, num_workers=10, drop_last=True)
-        self.val_loader = DataLoader(self.bundle_val_data, batch_size=batch_size_test, shuffle=False, num_workers=20)
-        self.test_loader = DataLoader(self.bundle_test_data, batch_size=batch_size_test, shuffle=False, num_workers=20)
+        default_workers_train = 0 if os.name == "nt" else 10
+        default_workers_test = 0 if os.name == "nt" else 20
+        num_workers_train = int(conf.get("num_workers_train", default_workers_train))
+        num_workers_test = int(conf.get("num_workers_test", default_workers_test))
+
+        self.train_loader = DataLoader(self.bundle_train_data, batch_size=batch_size_train, shuffle=True, num_workers=num_workers_train, drop_last=True)
+        self.val_loader = DataLoader(self.bundle_val_data, batch_size=batch_size_test, shuffle=False, num_workers=num_workers_test)
+        self.test_loader = DataLoader(self.bundle_test_data, batch_size=batch_size_test, shuffle=False, num_workers=num_workers_test)
 
 
     def get_data_size(self):

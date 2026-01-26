@@ -1,0 +1,8 @@
+numpy
+scipy
+PyYAML
+tqdm
+tensorboard
+torch
+torchvision
+torchaudio
