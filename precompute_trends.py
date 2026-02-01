@@ -27,8 +27,11 @@ def precompute_trends():
         # Construct a minimal conf for Datasets init
         conf = base_conf[dataset_name]
         conf['dataset'] = dataset_name
-        conf['device'] = torch.device('cpu') # Force CPU or let utility decide
-        # Note: utility.get_cir_trend will check cuda availability internally
+        # Force device to CUDA if available for the Dataset class init
+        # Although utility.get_cir_trend does its own check, Datasets init might use it?
+        # No, Datasets init just loads graphs.
+        # But let's set it to cuda:0 to be consistent.
+        conf['device'] = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu') 
         
         # Initialize Dataset (loads graphs)
         dataset = Datasets(conf)
