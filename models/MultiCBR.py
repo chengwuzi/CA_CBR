@@ -130,22 +130,12 @@ class MultiCBR(nn.Module):
         self.encoder_ui = GraphConv_CA(self.num_layers)
         self.encoder_bi = GraphConv_CA(self.num_layers)
         
-        # Aggregation graphs for UI/BI cross-view aggregation (Bundle<-Item, User<-Item)
-        # We still need the structure for aggregation step (Item->Bundle, Item->User)
-        # We can use the CIR weighted edges for aggregation too!
-        # Specifically, "UI_aggregation_graph" maps Items to Bundles? No.
-        # MultiCBR original: 
-        # UI_aggregation: Item -> User? No.
-        # Let's check original code:
-        # get_aggregation_graph(ui_graph) -> returns normalized UI graph (N_user x N_item)?
-        # aggregate(agg_graph, node_feature) -> matmul(agg_graph, node_feature)
-        # If agg_graph is (N_user, N_item), and node_feature is (N_item, D), result is (N_user, D).
-        # So it aggregates items to users.
-        
-        # For CAGCN*, we can implement "aggregate" using scatter too, reusing the trend weights.
-        # The trend matrix is symmetric (N+M, N+M).
-        # We need to extract the block corresponding to Item->User or Item->Bundle.
-        
+        # Initialize propagation graphs (default: full graph without dropout)
+        # We need these to be available even if ED_drop=False (e.g. first epoch or eval)
+        self.UB_propagation_graph = to_tensor(self.ub_graph).to(self.device)
+        self.UI_propagation_graph = to_tensor(self.ui_graph).to(self.device)
+        self.BI_propagation_graph = to_tensor(self.bi_graph).to(self.device)
+
         if self.conf['aug_type'] == 'MD':
             self.init_md_dropouts()
         elif self.conf['aug_type'] == "Noise":
