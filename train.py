@@ -133,8 +133,9 @@ def main():
 
         # model
         if conf['model'] == 'MultiCBR':
-            # Pass pre-calculated trends to model
-            model = MultiCBR(conf, dataset.graphs, dataset.trends).to(device)
+            # Pass pre-calculated trends to model via conf
+            conf["trends"] = dataset.trends
+            model = MultiCBR(conf, dataset.graphs).to(device)
         else:
             raise ValueError("Unimplemented model %s" % (conf["model"]))
 
