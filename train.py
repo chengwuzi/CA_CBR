@@ -279,6 +279,11 @@ def test(model, dataloader, conf):
 
 def get_metrics(metrics, grd, pred, topks):
     tmp = {"recall": {}, "ndcg": {}}
+    
+    # Ensure grd is on the same device as pred
+    if grd.device != pred.device:
+        grd = grd.to(pred.device)
+        
     for topk in topks:
         _, col_indice = torch.topk(pred, topk)
         row_indice = torch.zeros_like(col_indice) + torch.arange(pred.shape[0], device=pred.device, dtype=torch.long).view(-1, 1)
