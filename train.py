@@ -234,6 +234,8 @@ def log_metrics(conf, model, metrics, run, log_path, checkpoint_model_path, chec
         torch.save(model.state_dict(), checkpoint_model_path)
         dump_conf = dict(conf)
         del dump_conf["device"]
+        if "trends" in dump_conf:
+            del dump_conf["trends"]
         json.dump(dump_conf, open(checkpoint_conf_path, "w"))
         best_epoch = epoch
         curr_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
