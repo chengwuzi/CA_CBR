@@ -84,6 +84,11 @@ def main():
         if conf["aug_type"] == "OP":
             assert UB_ratio == 0 and UI_ratio == 0 and BI_ratio == 0
 
+        # CAGCN Settings
+        cagcn_type = conf.get("cagcn_type", "jc")
+        trend_coeff = conf.get("trend_coeff", 1.0)
+        settings += [f"CAGCN_{cagcn_type}_{trend_coeff}"]
+
         settings += ["Neg_%d" % (conf["neg_num"]), str(conf["batch_size_train"]), str(lr), str(l2_reg),
                      str(embedding_size)]
 
@@ -109,7 +114,8 @@ def main():
 
         # model
         if conf['model'] == 'MultiCBR':
-            model = MultiCBR(conf, dataset.graphs).to(device)
+            # Pass pre-calculated trends to model
+            model = MultiCBR(conf, dataset.graphs, dataset.trends).to(device)
         else:
             raise ValueError("Unimplemented model %s" % (conf["model"]))
 

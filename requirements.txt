@@ -1,8 +1,12 @@
+torch>=1.10.0
 numpy
 scipy
-PyYAML
+pyyaml
 tqdm
 tensorboard
-torch
-torchvision
-torchaudio
+# torch-scatter is optional but recommended for faster training on GPU
+# Note: On Linux/Server, install it via:
+# pip install torch-scatter -f https://data.pyg.org/whl/torch-${TORCH_VERSION}+${CUDA_VERSION}.html
+# e.g. for torch 2.0.0 + cu118:
+# pip install torch-scatter -f https://data.pyg.org/whl/torch-2.0.0+cu118.html
+torch-scatter

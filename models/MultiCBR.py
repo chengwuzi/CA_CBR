@@ -5,6 +5,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import scipy.sparse as sp 
+try:
+    from torch_scatter import scatter
+except ImportError:
+    scatter = None
+
+def scatter_sum(src, index, dim_size=None):
+    if scatter is not None:
+        return scatter(src, index, dim=0, dim_size=dim_size, reduce='add')
+    else:
+        # Pure PyTorch implementation
+        if dim_size is None:
+            dim_size = index.max().item() + 1
+        out = torch.zeros((dim_size, src.size(1)), dtype=src.dtype, device=src.device)
+        return out.index_add_(0, index, src)
 
 
 def cal_bpr_loss(pred):
@@ -22,14 +36,6 @@ def cal_bpr_loss(pred):
     return loss
 
 
-def laplace_transform(graph):
-    rowsum_sqrt = sp.diags(1/(np.sqrt(graph.sum(axis=1).A.ravel()) + 1e-8))
-    colsum_sqrt = sp.diags(1/(np.sqrt(graph.sum(axis=0).A.ravel()) + 1e-8))
-    graph = rowsum_sqrt @ graph @ colsum_sqrt
-
-    return graph
-
-
 def to_tensor(graph):
     graph = graph.tocoo()
     values = graph.data
@@ -45,8 +51,40 @@ def np_edge_dropout(values, dropout_ratio):
     return values
 
 
+class GraphConv_CA(nn.Module):
+    """
+    Collaborative Adaptive Graph Convolutional Network (from CAGCN)
+    """
+    def __init__(self, num_layers):
+        super(GraphConv_CA, self).__init__()
+        self.num_layers = num_layers
+
+    def forward(self, embed, edge_index, trend):
+        # embed: [n_nodes, channel]
+        # edge_index: [2, n_edges]
+        # trend: [n_edges] (CIR weights)
+        
+        agg_embed = embed
+        embs = [embed]
+        
+        row, col = edge_index
+        n_nodes = embed.shape[0]
+
+        for hop in range(self.num_layers):
+            # Message Passing:
+            # out[e] = embed[row[e]] * trend[e]
+            out = agg_embed[row] * trend.unsqueeze(-1)
+            
+            # Aggregation: sum messages to destination node (col)
+            agg_embed = scatter_sum(out, col, dim_size=n_nodes)
+            
+            embs.append(F.normalize(agg_embed, p=2, dim=1)) # Normalize as in MultiCBR
+
+        return embs
+
+
 class MultiCBR(nn.Module):
-    def __init__(self, conf, raw_graph):
+    def __init__(self, conf, raw_graph, trends=None):
         super().__init__()
         self.conf = conf
         device = self.conf["device"]
@@ -59,6 +97,7 @@ class MultiCBR(nn.Module):
         self.num_items = conf["num_items"]
         self.num_layers = self.conf["num_layers"]
         self.c_temp = self.conf["c_temp"]
+        self.trend_coeff = conf.get("trend_coeff", 1.0)
 
         self.fusion_weights = conf['fusion_weights']
 
@@ -67,25 +106,46 @@ class MultiCBR(nn.Module):
 
         assert isinstance(raw_graph, list)
         self.ub_graph, self.ui_graph, self.bi_graph = raw_graph
+        
+        # Load CIR trends if provided
+        self.trends = trends
+        if self.trends is not None:
+            self.trend_ub, self.trend_ui, self.trend_bi = [t.to(device) for t in self.trends]
+            
+            # Extract indices and values for CAGCN propagation
+            self.ub_indices = self.trend_ub.indices()
+            self.ub_values = self.trend_ub.values() * self.trend_coeff
+            
+            self.ui_indices = self.trend_ui.indices()
+            self.ui_values = self.trend_ui.values() * self.trend_coeff
+            
+            self.bi_indices = self.trend_bi.indices()
+            self.bi_values = self.trend_bi.values() * self.trend_coeff
+        else:
+            # Fallback to original logic if trends not provided (or error)
+            raise ValueError("CIR trends must be provided for CAGCN mode")
 
-        # generate the graph without any dropouts for testing
-        self.UB_propagation_graph_ori = self.get_propagation_graph(self.ub_graph)
-
-        self.UI_propagation_graph_ori = self.get_propagation_graph(self.ui_graph)
-        self.UI_aggregation_graph_ori = self.get_aggregation_graph(self.ui_graph)
-
-        self.BI_propagation_graph_ori = self.get_propagation_graph(self.bi_graph)
-        self.BI_aggregation_graph_ori = self.get_aggregation_graph(self.bi_graph)
-
-        # generate the graph with the configured dropouts for training, if aug_type is OP or MD, the following graphs with be identical with the aboves
-        self.UB_propagation_graph = self.get_propagation_graph(self.ub_graph, self.conf["UB_ratio"])
-
-        self.UI_propagation_graph = self.get_propagation_graph(self.ui_graph, self.conf["UI_ratio"])
-        self.UI_aggregation_graph = self.get_aggregation_graph(self.ui_graph, self.conf["UI_ratio"])
-
-        self.BI_propagation_graph = self.get_propagation_graph(self.bi_graph, self.conf["BI_ratio"])
-        self.BI_aggregation_graph = self.get_aggregation_graph(self.bi_graph, self.conf["BI_ratio"])
-
+        # CAGCN* Encoders for each view
+        self.encoder_ub = GraphConv_CA(self.num_layers)
+        self.encoder_ui = GraphConv_CA(self.num_layers)
+        self.encoder_bi = GraphConv_CA(self.num_layers)
+        
+        # Aggregation graphs for UI/BI cross-view aggregation (Bundle<-Item, User<-Item)
+        # We still need the structure for aggregation step (Item->Bundle, Item->User)
+        # We can use the CIR weighted edges for aggregation too!
+        # Specifically, "UI_aggregation_graph" maps Items to Bundles? No.
+        # MultiCBR original: 
+        # UI_aggregation: Item -> User? No.
+        # Let's check original code:
+        # get_aggregation_graph(ui_graph) -> returns normalized UI graph (N_user x N_item)?
+        # aggregate(agg_graph, node_feature) -> matmul(agg_graph, node_feature)
+        # If agg_graph is (N_user, N_item), and node_feature is (N_item, D), result is (N_user, D).
+        # So it aggregates items to users.
+        
+        # For CAGCN*, we can implement "aggregate" using scatter too, reusing the trend weights.
+        # The trend matrix is symmetric (N+M, N+M).
+        # We need to extract the block corresponding to Item->User or Item->Bundle.
+        
         if self.conf['aug_type'] == 'MD':
             self.init_md_dropouts()
         elif self.conf['aug_type'] == "Noise":
@@ -144,60 +204,79 @@ class MultiCBR(nn.Module):
         self.BI_layer_coefs = BI_layer_coefs.unsqueeze(0).unsqueeze(-1).to(self.device)
 
 
-    def get_propagation_graph(self, bipartite_graph, modification_ratio=0):
-        device = self.device
-        propagation_graph = sp.bmat([[sp.csr_matrix((bipartite_graph.shape[0], bipartite_graph.shape[0])), bipartite_graph], [bipartite_graph.T, sp.csr_matrix((bipartite_graph.shape[1], bipartite_graph.shape[1]))]])
-
-        if modification_ratio != 0:
-            if self.conf["aug_type"] == "ED":
-                graph = propagation_graph.tocoo()
-                values = np_edge_dropout(graph.data, modification_ratio)
-                propagation_graph = sp.coo_matrix((values, (graph.row, graph.col)), shape=graph.shape).tocsr()
-
-        return to_tensor(laplace_transform(propagation_graph)).to(device)
-
-
-    def get_aggregation_graph(self, bipartite_graph, modification_ratio=0):
-        device = self.device
-
-        if modification_ratio != 0:
-            if self.conf["aug_type"] == "ED":
-                graph = bipartite_graph.tocoo()
-                values = np_edge_dropout(graph.data, modification_ratio)
-                bipartite_graph = sp.coo_matrix((values, (graph.row, graph.col)), shape=graph.shape).tocsr()
-
-        bundle_size = bipartite_graph.sum(axis=1) + 1e-8
-        bipartite_graph = sp.diags(1/bundle_size.A.ravel()) @ bipartite_graph
-        return to_tensor(bipartite_graph).to(device)
-
-
-    def propagate(self, graph, A_feature, B_feature, graph_type, layer_coef, test):
+    def propagate_cagcn(self, encoder, A_feature, B_feature, indices, values, graph_type, layer_coef, test):
+        # Concatenate features: [A; B]
         features = torch.cat((A_feature, B_feature), 0)
-        all_features = [features]
-
-        for i in range(self.num_layers):
-            features = torch.spmm(graph, features)
+        
+        # CAGCN Propagation
+        all_features_list = encoder(features, indices, values)
+        # all_features_list is [embed_0, embed_1, ...]
+        
+        # Apply Dropout/Noise if needed (on intermediate layers?)
+        # MultiCBR applies dropout AFTER propagation loop on the FINAL aggregated feature?
+        # No, MultiCBR propagate:
+        # for i in range(num_layers):
+        #    features = spmm(features)
+        #    if dropout: features = dropout(features)
+        #    all_features.append(features)
+        # We need to inject dropout into the list
+        
+        processed_features = [all_features_list[0]] # embed_0 (no dropout)
+        
+        for i in range(1, len(all_features_list)):
+            feat = all_features_list[i]
             if self.conf["aug_type"] == "MD" and not test:
                 mess_dropout = self.mess_dropout_dict[graph_type]
-                features = mess_dropout(features)
+                feat = mess_dropout(feat)
             elif self.conf["aug_type"] == "Noise" and not test:
-                random_noise = torch.rand_like(features).to(self.device)
+                random_noise = torch.rand_like(feat).to(self.device)
                 eps = self.eps_dict[graph_type]
-                features += torch.sign(features) * F.normalize(random_noise, dim=-1) * eps
+                feat += torch.sign(feat) * F.normalize(random_noise, dim=-1) * eps
+            processed_features.append(feat)
 
-            all_features.append(F.normalize(features, p=2, dim=1))
-
-        all_features = torch.stack(all_features, 1) * layer_coef
+        # Layer Fusion
+        # stack: [N, num_layers+1, D]
+        all_features = torch.stack(processed_features, 1) * layer_coef
         all_features = torch.sum(all_features, dim=1)
+        
         A_feature, B_feature = torch.split(all_features, (A_feature.shape[0], B_feature.shape[0]), 0)
 
         return A_feature, B_feature
 
 
-    def aggregate(self, agg_graph, node_feature, graph_type, test):
-        aggregated_feature = torch.matmul(agg_graph, node_feature)
-
-        # simple embedding dropout on bundle embeddings
+    def aggregate_cagcn(self, node_feature, indices, values, target_dim, source_dim, graph_type, test):
+        # Aggregate from Source -> Target
+        # indices is symmetric [ (r1, c1), (r2, c2) ... ] for the full bipartite graph
+        # We need the block that maps Source indices to Target indices.
+        # e.g. BI aggregation: Items(Source) -> Bundles(Target).
+        # In BI graph: Rows=Bundles, Cols=Items.
+        # Full matrix: [[0, BI], [BI.T, 0]].
+        # BI block: Row range [0, n_B], Col range [n_B, n_B+n_I].
+        # We want to aggregate FROM cols TO rows.
+        
+        # For simplicity, we can filter edges where row < target_dim and col >= target_dim
+        # But this filtering is slow every time.
+        # Alternatively, we can assume the symmetric indices handle full propagation,
+        # so we can just propagate one step on the full graph, and take the Target part.
+        
+        # Construct full feature vector: [Target_Zero; Source_Feature]
+        # Then propagate 1 step. Result[0:target_dim] is the aggregation.
+        
+        zeros = torch.zeros(target_dim, node_feature.shape[1]).to(self.device)
+        full_feature = torch.cat([zeros, node_feature], 0)
+        
+        row, col = indices
+        
+        # One step propagation
+        # out[e] = feature[row[e]] * value[e]
+        # agg[c] = sum(out[row==...])
+        # We use scatter sum
+        out = full_feature[row] * values.unsqueeze(-1)
+        agg_full = scatter_sum(out, col, dim_size=target_dim + source_dim)
+        
+        aggregated_feature = agg_full[:target_dim]
+        
+        # Apply Dropout/Noise
         if self.conf["aug_type"] == "MD" and not test:
             mess_dropout = self.mess_dropout_dict[graph_type]
             aggregated_feature = mess_dropout(aggregated_feature)
@@ -222,26 +301,36 @@ class MultiCBR(nn.Module):
 
     def get_multi_modal_representations(self, test=False):
         #  =============================  UB graph propagation  =============================
-        if test:
-            UB_users_feature, UB_bundles_feature = self.propagate(self.UB_propagation_graph_ori, self.users_feature, self.bundles_feature, "UB", self.UB_layer_coefs, test)
-        else:
-            UB_users_feature, UB_bundles_feature = self.propagate(self.UB_propagation_graph, self.users_feature, self.bundles_feature, "UB", self.UB_layer_coefs, test)
+        UB_users_feature, UB_bundles_feature = self.propagate_cagcn(
+            self.encoder_ub, self.users_feature, self.bundles_feature, 
+            self.ub_indices, self.ub_values, "UB", self.UB_layer_coefs, test
+        )
 
         #  =============================  UI graph propagation  =============================
-        if test:
-            UI_users_feature, UI_items_feature = self.propagate(self.UI_propagation_graph_ori, self.users_feature, self.items_feature, "UI", self.UI_layer_coefs, test)
-            UI_bundles_feature = self.aggregate(self.BI_aggregation_graph_ori, UI_items_feature, "BI", test)
-        else:
-            UI_users_feature, UI_items_feature = self.propagate(self.UI_propagation_graph, self.users_feature, self.items_feature, "UI", self.UI_layer_coefs, test)
-            UI_bundles_feature = self.aggregate(self.BI_aggregation_graph, UI_items_feature, "BI", test)
+        UI_users_feature, UI_items_feature = self.propagate_cagcn(
+            self.encoder_ui, self.users_feature, self.items_feature, 
+            self.ui_indices, self.ui_values, "UI", self.UI_layer_coefs, test
+        )
+        
+        # Aggregate Items -> Bundles (using BI graph structure)
+        # BI graph: Bundles (Rows), Items (Cols)
+        UI_bundles_feature = self.aggregate_cagcn(
+            UI_items_feature, self.bi_indices, self.bi_values, 
+            self.num_bundles, self.num_items, "BI", test
+        )
 
         #  =============================  BI graph propagation  =============================
-        if test:
-            BI_bundles_feature, BI_items_feature = self.propagate(self.BI_propagation_graph_ori, self.bundles_feature, self.items_feature, "BI", self.BI_layer_coefs, test)
-            BI_users_feature = self.aggregate(self.UI_aggregation_graph_ori, BI_items_feature, "UI", test)
-        else:
-            BI_bundles_feature, BI_items_feature = self.propagate(self.BI_propagation_graph, self.bundles_feature, self.items_feature, "BI", self.BI_layer_coefs, test)
-            BI_users_feature = self.aggregate(self.UI_aggregation_graph, BI_items_feature, "UI", test)
+        BI_bundles_feature, BI_items_feature = self.propagate_cagcn(
+            self.encoder_bi, self.bundles_feature, self.items_feature, 
+            self.bi_indices, self.bi_values, "BI", self.BI_layer_coefs, test
+        )
+        
+        # Aggregate Items -> Users (using UI graph structure)
+        # UI graph: Users (Rows), Items (Cols)
+        BI_users_feature = self.aggregate_cagcn(
+            BI_items_feature, self.ui_indices, self.ui_values, 
+            self.num_users, self.num_items, "UI", test
+        )
 
         users_feature = [UB_users_feature, UI_users_feature, BI_users_feature]
         bundles_feature = [UB_bundles_feature, UI_bundles_feature, BI_bundles_feature]
