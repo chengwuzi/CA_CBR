@@ -316,12 +316,12 @@ def get_ndcg(pred, grd, is_hit, topk):
         return hit.sum(-1)
 
     def IDCG(num_pos, topk, device):
-        hit = torch.zeros(topk, dtype=torch.float)
+        hit = torch.zeros(topk, dtype=torch.float).to(device)
         hit[:num_pos] = 1
         return DCG(hit, topk, device)
 
     device = grd.device
-    IDCGs = torch.empty(1 + topk, dtype=torch.float)
+    IDCGs = torch.empty(1 + topk, dtype=torch.float).to(device)
     IDCGs[0] = 1  # avoid 0/0
     for i in range(1, topk + 1):
         IDCGs[i] = IDCG(i, topk, device)
@@ -330,7 +330,7 @@ def get_ndcg(pred, grd, is_hit, topk):
     dcg = DCG(is_hit, topk, device)
 
     idcg = IDCGs[num_pos]
-    ndcg = dcg / idcg.to(device)
+    ndcg = dcg / idcg
 
     denorm = pred.shape[0] - (num_pos == 0).sum().item()
     nomina = ndcg.sum().item()
