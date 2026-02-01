@@ -23,6 +23,14 @@ def main():
     # Log directory
     os.makedirs("experiment_logs", exist_ok=True)
     
+    # Check GPU info once at startup
+    print("Checking GPU status...")
+    try:
+        subprocess.run(["nvidia-smi"], check=True)
+    except Exception:
+        print("Warning: nvidia-smi not found or failed. GPU info might not be available.")
+    print("\n" + "="*50 + "\n")
+    
     for dataset, c_type, t_coeff in itertools.product(datasets, cagcn_types, trend_coeffs):
         print(f"=========================================================")
         print(f"Running Experiment: Dataset={dataset}, Type={c_type}, Coeff={t_coeff}")
