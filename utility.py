@@ -181,50 +181,14 @@ class Datasets():
             
         print(f'Calculating trend for {name} ({type})...')
         
-        # Convert to torch tensor for GPU calculation if possible
-        # Since we have 24G GPU, we can try to do it on GPU with dense matrix if size permits
-        # Or use sparse matrix operations on CPU/GPU
-        
-        # Here we implement Matrix-Formed calculation as in CAGCN
-        # graph shape: [N_row, N_col]
-        # We need to calculate weights for the full bipartite graph:
-        # [[0, R], [R.T, 0]]
-        # The output trend should be a sparse tensor corresponding to the edges in the bipartite graph
-        
-        # 1. Construct dense interaction matrix (if possible) or use sparse multiplication
-        # Given the dataset size (NetEase: 18K users, 22K bundles, 123K items)
-        # 123K * 123K float32 dense matrix is ~60GB, so we CANNOT form the full item-item matrix densely even on 24G GPU
-        # We must stick to sparse operations or batch-wise dense operations.
-        # CAGCN's 'co_ratio_deg_user_jacard' uses dense matrix which might OOM for items.
-        # However, we only need the values at existing edges (Trend * Adjacency).
-        # But CAGCN's implementation actually computes the similarity between users (based on items) 
-        # and items (based on users), then assigns these similarities as edge weights.
-        # Wait, CAGCN's code: 
-        # edge_weight[users, i + n_users] = jacard_simi
-        # It assigns the user-user similarity (or user-item?) let's re-read CAGCN logic carefully.
-        
-        # Re-reading CAGCN utils.py:
-        # for i in range(n_items): 
-        #    users = user_item_graph[:, i].nonzero() ...
-        #    items = user_item_graph[users] ...
-        #    user_user_cap = items @ items.t() ...
-        #    jacard_simi = ...
-        #    edge_weight[users, i + n_users] = jacard_simi
-        
-        # It calculates, for each item i, the similarity between the users who interacted with i.
-        # Wait, "user_user_cap" is (num_users_interacted_with_i x num_users_interacted_with_i).
-        # Then "jacard_simi = ... .mean(dim=1)".
-        # It means for a specific edge (u, i), the weight is the average Jaccard similarity 
-        # between u and ALL OTHER users who also interacted with i.
-        # This is "Collaboration-Aware": how much u is similar to the group of users who bought i.
-        
-        # Let's implement this logic using sparse matrices to save memory.
-        # Or since we know we have 24G GPU, maybe we can do it batch-wise.
-        
+        # Check if we can use GPU
+        # Note: We need to explicitly check CUDA availability again here because this method might be called 
+        # before the global torch.cuda.set_device is fully effective or just to be safe.
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {device} for CIR calculation")
         
         # Convert scipy sparse to torch sparse
+        # We need coo on CPU first to extract indices
         coo = graph.tocoo()
         indices = torch.from_numpy(np.vstack((coo.row, coo.col)).astype(np.int64)).to(device)
         values = torch.from_numpy(coo.data.astype(np.float32)).to(device)
