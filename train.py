@@ -318,7 +318,7 @@ def get_ndcg(pred, grd, is_hit, topk):
         return hit.sum(-1)
 
     def IDCG(num_pos, topk, device):
-        hit = torch.zeros(topk, dtype=torch.float)
+        hit = torch.zeros(topk, dtype=torch.float, device=device)
         hit[:num_pos] = 1
         return DCG(hit, topk, device)
 
