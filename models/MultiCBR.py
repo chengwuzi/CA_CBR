@@ -263,8 +263,11 @@ class MultiCBR(nn.Module):
             for i in range(len(trend_features_list)):
                 # Simple addition: Origin + Trend
                 # Since values in trend already multiplied by trend_coeff
-                fused = origin_features_list[i] + trend_features_list[i]
-                final_features_list.append(fused)
+                # fused = origin_features_list[i] + trend_features_list[i]
+                # final_features_list.append(fused)
+                
+                # DEBUG MODE: Only use Original Graph
+                final_features_list.append(origin_features_list[i])
         else:
             # Fallback (should not happen in this fix)
             final_features_list = trend_features_list
