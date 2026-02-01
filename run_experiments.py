@@ -2,17 +2,31 @@ import os
 import yaml
 import subprocess
 import itertools
+import argparse
 
 def main():
+    # Parse command line arguments for selective execution
+    parser = argparse.ArgumentParser(description="Run MultiCBR Experiments")
+    parser.add_argument("--dataset", "-d", type=str, help="Specific dataset to run (e.g., NetEase). If not set, run all.")
+    parser.add_argument("--metric", "-m", type=str, help="Specific metric to run (e.g., jc). If not set, run all.")
+    args = parser.parse_args()
+
     # Load base config
     with open("./config.yaml", "r") as f:
         conf = yaml.safe_load(f)
     
     # Define experiment space
-    datasets = ["NetEase", "iFashion", "Youshu"]
-    # datasets = ["NetEase"] # For quick testing
-    cagcn_types = ["jc", "sc", "lhn", "co"]
-    # cagcn_types = ["jc"] # For quick testing
+    # If args provided, use them; otherwise use full list
+    if args.dataset:
+        datasets = [args.dataset]
+    else:
+        datasets = ["NetEase", "iFashion", "Youshu"]
+        
+    if args.metric:
+        cagcn_types = [args.metric]
+    else:
+        cagcn_types = ["jc", "sc", "lhn", "co"]
+        
     trend_coeffs = [1.0] # Can expand later
     
     # Path to python interpreter
