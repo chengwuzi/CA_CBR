@@ -282,9 +282,6 @@ def get_metrics(metrics, grd, pred, topks):
     for topk in topks:
         _, col_indice = torch.topk(pred, topk)
         row_indice = torch.zeros_like(col_indice) + torch.arange(pred.shape[0], device=pred.device, dtype=torch.long).view(-1, 1)
-        
-        # Ensure grd is on the same device as indices
-        grd = grd.to(pred.device)
         is_hit = grd[row_indice.view(-1), col_indice.view(-1)].view(-1, topk)
 
         tmp["recall"][topk] = get_recall(pred, grd, is_hit, topk)
@@ -316,12 +313,12 @@ def get_ndcg(pred, grd, is_hit, topk):
         return hit.sum(-1)
 
     def IDCG(num_pos, topk, device):
-        hit = torch.zeros(topk, dtype=torch.float).to(device)
+        hit = torch.zeros(topk, dtype=torch.float)
         hit[:num_pos] = 1
         return DCG(hit, topk, device)
 
     device = grd.device
-    IDCGs = torch.empty(1 + topk, dtype=torch.float).to(device)
+    IDCGs = torch.empty(1 + topk, dtype=torch.float)
     IDCGs[0] = 1  # avoid 0/0
     for i in range(1, topk + 1):
         IDCGs[i] = IDCG(i, topk, device)
@@ -330,7 +327,7 @@ def get_ndcg(pred, grd, is_hit, topk):
     dcg = DCG(is_hit, topk, device)
 
     idcg = IDCGs[num_pos]
-    ndcg = dcg / idcg
+    ndcg = dcg / idcg.to(device)
 
     denorm = pred.shape[0] - (num_pos == 0).sum().item()
     nomina = ndcg.sum().item()

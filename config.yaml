@@ -1,7 +1,7 @@
 NetEase:
   data_path: './datasets'
-  batch_size_train: 8192 # Increased for RTX 3090
-  batch_size_test: 4096
+  batch_size_train: 2048
+  batch_size_test: 2048 # 4096 is also fine for test, but let's be safe
   topk: [10, 20, 40, 80] # the topks metrics for evaluation
   neg_num: 1 # number of negatives used for BPR loss. All the experiments use 1.
 
@@ -25,7 +25,7 @@ NetEase:
     UI_layer: [0.25, 0.65, 0.1] # layer aggregation coefficients in UI graph
     BI_layer: [0.4, 0.4, 0.2] # layer aggregation coefficients in BI graph
 
-  lrs: [3.0e-3] # learning rate (Scaled up for larger batch size)
+  lrs: [1.0e-3]
   l2_regs: [1.0e-5] # the l2 regularization weight: lambda_2
   c_lambdas: [0.05] # the contrastive loss weight: lambda_1
   c_temps: [0.2] # the temperature in the contrastive loss: tau
