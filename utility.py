@@ -421,93 +421,11 @@ class Datasets():
                 # S_block is (batch_size x N_row).
                 # W_block should be (batch_size x N_col).
                 
-                # Check shapes
-                # print(f"S_block: {S_block.shape}, A_full: {A_full_sparse.shape}")
-                
                 # We use: (A.t() @ S.t()).t()
                 # A.t() is (N_col x N_row) sparse.
                 # S.t() is (N_row x batch_size) dense.
                 # Result is (N_col x batch_size) dense.
                 # Transpose back -> (batch_size x N_col).
-                
-                W_block = torch.sparse.mm(A_full_sparse.t(), S_block.t()).t()
-                
-                # 3. Filter: keep only edges where A_block != 0
-                # A_block_dense is 1.0 where edge exists.
-                # A_block_dense shape is (batch_size x N_col).
-                
-                # IMPORTANT: In compute_side_weights call for TRANSPOSED matrix:
-                # We pass csr.transpose() which is (N_col x N_row).
-                # So n_row inside function is actually N_col of original.
-                # And n_col inside function is N_row of original.
-                # A_block_dense will be (batch_size x N_row_original).
-                # W_block will be (batch_size x N_row_original).
-                # So shapes should match.
-                
-                # However, the error says: size 18528 must match 22864.
-                # 18528 is N_user (rows of UB).
-                # 22864 is N_bundle (cols of UB).
-                
-                # When computing row-side (U-side):
-                # Input: UB (18K x 22K).
-                # n_row=18K. A_block is (batch x 22K).
-                # S_block is (batch x 18K).
-                # W_block = S @ A = (batch x 22K).
-                # W_block * A_block -> (batch x 22K) * (batch x 22K). MATCH.
-                
-                # When computing col-side (B-side):
-                # Input: UB.T (22K x 18K).
-                # n_row=22K. A_block is (batch x 18K).
-                # S_block is (batch x 22K).
-                # W_block = S @ A = (batch x 18K).
-                # W_block * A_block -> (batch x 18K) * (batch x 18K). MATCH.
-                
-                # Wait, let's look at the error again.
-                # The size of tensor a (18528) must match the size of tensor b (22864) at non-singleton dimension 1
-                # This error usually happens at element-wise operation like + or *.
-                # Likely at: W_filtered = W_block * A_block_dense
-                # Or: W_filtered = W_filtered / (D_col + 1e-8)
-                
-                # If it's W_filtered / D_col:
-                # D_col is (1 x N_col_local).
-                # For Row-side: D_col is (1 x 22K). W_filtered is (batch x 22K). Matches.
-                # For Col-side: D_col is (1 x 18K). W_filtered is (batch x 18K). Matches.
-                
-                # Wait, where does D_col come from?
-                # D_col = torch.from_numpy(col_deg).float()...
-                # col_deg is passed in.
-                
-                # In compute_side_weights call 1:
-                # compute_side_weights(csr, csc, row_deg, type)
-                # D_col uses 'col_deg' GLOBAL variable? No, it uses 'col_deg' argument?
-                # The function definition is: def compute_side_weights(adj_csr, adj_csc, row_degs, type):
-                # It does NOT take col_degs as argument!
-                # It uses 'col_deg' from OUTER SCOPE!
-                
-                # AHA!
-                # D_col = torch.from_numpy(col_deg).float()...
-                # 'col_deg' is defined in get_cir_trend scope:
-                # col_deg = np.array(graph.sum(axis=0)).flatten()
-                
-                # When we call compute_side_weights(csr.transpose()...), we are inside the loop or function.
-                # But 'col_deg' variable refers to the ORIGINAL graph's column degrees (N_col size).
-                
-                # Case 1: Row-side (U-side).
-                # Graph is (N_row x N_col).
-                # compute_side_weights(graph...)
-                # We normalize by D_col (N_col size). Correct.
-                
-                # Case 2: Col-side (B-side).
-                # Graph is (N_col x N_row).
-                # compute_side_weights(graph.T...)
-                # We normalize by D_col... wait.
-                # The "columns" of graph.T are the "rows" of original graph.
-                # So we should normalize by ORIGINAL ROW DEGREES.
-                # But the code uses 'col_deg' (ORIGINAL COL DEGREES).
-                # Size mismatch!
-                # N_col (22K) != N_row (18K).
-                
-                # FIX: Pass col_degs explicitly to compute_side_weights.
                 
                 W_block = torch.sparse.mm(A_full_sparse.t(), S_block.t()).t()
                 
