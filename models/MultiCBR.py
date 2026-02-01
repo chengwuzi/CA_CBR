@@ -71,6 +71,9 @@ class GraphConv_CA(nn.Module):
         # embed: [n_nodes, channel]
         # edge_index: [2, n_edges]
         # trend: [n_edges] (CIR weights)
+
+        if trend.device != embed.device:
+            trend = trend.to(embed.device)
         
         agg_embed = embed
         embs = [embed]
@@ -314,24 +317,16 @@ class MultiCBR(nn.Module):
         return A_out, B_out
 
 
-    def aggregate_cagcn(self, node_feature, indices, values, target_dim, source_dim, graph_type, test):
+    def aggregate_cagcn(self, node_feature, indices, values, target_dim, source_dim, graph_type, test, original_graph=None):
         # Aggregate from Source -> Target
-        # indices is symmetric [ (r1, c1), (r2, c2) ... ] for the full bipartite graph
-        # We need the block that maps Source indices to Target indices.
-        # e.g. BI aggregation: Items(Source) -> Bundles(Target).
-        # In BI graph: Rows=Bundles, Cols=Items.
-        # Full matrix: [[0, BI], [BI.T, 0]].
-        # BI block: Row range [0, n_B], Col range [n_B, n_B+n_I].
-        # We want to aggregate FROM cols TO rows.
-        
-        # For simplicity, we can filter edges where row < target_dim and col >= target_dim
-        # But this filtering is slow every time.
-        # Alternatively, we can assume the symmetric indices handle full propagation,
-        # so we can just propagate one step on the full graph, and take the Target part.
-        
-        # Construct full feature vector: [Target_Zero; Source_Feature]
-        # Then propagate 1 step. Result[0:target_dim] is the aggregation.
-        
+        # Dual Stream Aggregation:
+        # 1. Original Aggregation (using original_graph)
+        # 2. Trend Aggregation (using indices, values)
+
+        aggregated_feature_trend = None
+        aggregated_feature_origin = None
+
+        # --- Stream 1: Trend Aggregation ---
         zeros = torch.zeros(target_dim, node_feature.shape[1]).to(self.device)
         full_feature = torch.cat([zeros, node_feature], 0)
         
@@ -339,14 +334,26 @@ class MultiCBR(nn.Module):
         
         # One step propagation
         # out[e] = feature[row[e]] * value[e]
-        # agg[c] = sum(out[row==...])
-        # We use scatter sum
         out = full_feature[row] * values.unsqueeze(-1)
         agg_full = scatter_sum(out, col, dim_size=target_dim + source_dim)
         
-        aggregated_feature = agg_full[:target_dim]
+        aggregated_feature_trend = agg_full[:target_dim]
+
+        # --- Stream 2: Original Aggregation ---
+        if original_graph is not None:
+             # original_graph is typically (Target x Source) or similar?
+             # MultiCBR RAW uses `aggregate` function:
+             # aggregated_feature = torch.matmul(agg_graph, node_feature)
+             aggregated_feature_origin = torch.matmul(original_graph, node_feature)
         
-        # Apply Dropout/Noise
+        # --- Fusion ---
+        if aggregated_feature_origin is not None:
+             # Fuse: Origin + Trend
+             aggregated_feature = aggregated_feature_origin + aggregated_feature_trend
+        else:
+             aggregated_feature = aggregated_feature_trend
+        
+        # Apply Dropout/Noise (Aligned with RAW logic)
         if self.conf["aug_type"] == "MD" and not test:
             mess_dropout = self.mess_dropout_dict[graph_type]
             aggregated_feature = mess_dropout(aggregated_feature)
@@ -388,7 +395,8 @@ class MultiCBR(nn.Module):
         # BI graph: Bundles (Rows), Items (Cols)
         UI_bundles_feature = self.aggregate_cagcn(
             UI_items_feature, self.bi_indices, self.bi_values, 
-            self.num_bundles, self.num_items, "BI", test
+            self.num_bundles, self.num_items, "BI", test,
+            original_graph=self.BI_aggregation_graph
         )
 
         #  =============================  BI graph propagation  =============================
@@ -402,7 +410,8 @@ class MultiCBR(nn.Module):
         # UI graph: Users (Rows), Items (Cols)
         BI_users_feature = self.aggregate_cagcn(
             BI_items_feature, self.ui_indices, self.ui_values, 
-            self.num_users, self.num_items, "UI", test
+            self.num_users, self.num_items, "UI", test,
+            original_graph=self.UI_aggregation_graph
         )
 
         users_feature = [UB_users_feature, UI_users_feature, BI_users_feature]
