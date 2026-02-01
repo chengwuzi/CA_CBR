@@ -9,4 +9,4 @@ tensorboard
 # pip install torch-scatter -f https://data.pyg.org/whl/torch-${TORCH_VERSION}+${CUDA_VERSION}.html
 # e.g. for torch 2.0.0 + cu118:
 # pip install torch-scatter -f https://data.pyg.org/whl/torch-2.0.0+cu118.html
-torch-scatter
+# torch-scatter # Uncomment this on server if you want acceleration (requires matching CUDA version)
