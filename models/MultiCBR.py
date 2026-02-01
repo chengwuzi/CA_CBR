@@ -5,20 +5,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import scipy.sparse as sp 
-try:
-    from torch_scatter import scatter
-except ImportError:
-    scatter = None
-
-def scatter_sum(src, index, dim_size=None):
-    if scatter is not None:
-        return scatter(src, index, dim=0, dim_size=dim_size, reduce='add')
-    else:
-        # Pure PyTorch implementation
-        if dim_size is None:
-            dim_size = index.max().item() + 1
-        out = torch.zeros((dim_size, src.size(1)), dtype=src.dtype, device=src.device)
-        return out.index_add_(0, index, src)
 
 
 def cal_bpr_loss(pred):
@@ -59,70 +45,8 @@ def np_edge_dropout(values, dropout_ratio):
     return values
 
 
-class GraphConv_CA(nn.Module):
-    """
-    Collaborative Adaptive Graph Convolutional Network (from CAGCN)
-    """
-    def __init__(self, num_layers):
-        super(GraphConv_CA, self).__init__()
-        self.num_layers = num_layers
-
-    def forward(self, embed, edge_index, trend):
-        # embed: [n_nodes, channel]
-        # edge_index: [2, n_edges]
-        # trend: [n_edges] (CIR weights)
-
-        if trend.device != embed.device:
-            trend = trend.to(embed.device)
-        
-        agg_embed = embed
-        embs = [embed]
-        
-        row, col = edge_index
-        n_nodes = embed.shape[0]
-
-        for hop in range(self.num_layers):
-            # Message Passing:
-            # out[e] = embed[row[e]] * trend[e]
-            out = agg_embed[row] * trend.unsqueeze(-1)
-            
-            # Aggregation: sum messages to destination node (col)
-            agg_embed = scatter_sum(out, col, dim_size=n_nodes)
-            
-            embs.append(F.normalize(agg_embed, p=2, dim=1)) # Normalize as in MultiCBR
-
-        return embs
-
-
 class MultiCBR(nn.Module):
-    def get_propagation_graph(self, bipartite_graph, modification_ratio=0):
-        device = self.device
-        propagation_graph = sp.bmat([[sp.csr_matrix((bipartite_graph.shape[0], bipartite_graph.shape[0])), bipartite_graph], [bipartite_graph.T, sp.csr_matrix((bipartite_graph.shape[1], bipartite_graph.shape[1]))]])
-
-        if modification_ratio != 0:
-            if self.conf["aug_type"] == "ED":
-                graph = propagation_graph.tocoo()
-                values = np_edge_dropout(graph.data, modification_ratio)
-                propagation_graph = sp.coo_matrix((values, (graph.row, graph.col)), shape=graph.shape).tocsr()
-
-        return to_tensor(laplace_transform(propagation_graph)).to(device)
-
-
-    def get_aggregation_graph(self, bipartite_graph, modification_ratio=0):
-        device = self.device
-
-        if modification_ratio != 0:
-            if self.conf["aug_type"] == "ED":
-                graph = bipartite_graph.tocoo()
-                values = np_edge_dropout(graph.data, modification_ratio)
-                bipartite_graph = sp.coo_matrix((values, (graph.row, graph.col)), shape=graph.shape).tocsr()
-
-        bundle_size = bipartite_graph.sum(axis=1) + 1e-8
-        bipartite_graph = sp.diags(1/bundle_size.A.ravel()) @ bipartite_graph
-        return to_tensor(bipartite_graph).to(device)
-
-
-    def __init__(self, conf, raw_graph, trends=None):
+    def __init__(self, conf, raw_graph):
         super().__init__()
         self.conf = conf
         device = self.conf["device"]
@@ -135,9 +59,11 @@ class MultiCBR(nn.Module):
         self.num_items = conf["num_items"]
         self.num_layers = self.conf["num_layers"]
         self.c_temp = self.conf["c_temp"]
-        self.trend_coeff = conf.get("trend_coeff", 1.0)
 
         self.fusion_weights = conf['fusion_weights']
+        
+        # CAGCN settings
+        self.trend_coeff = conf.get("trend_coeff", 1.0)
 
         self.init_emb()
         self.init_fusion_weights()
@@ -145,38 +71,37 @@ class MultiCBR(nn.Module):
         assert isinstance(raw_graph, list)
         self.ub_graph, self.ui_graph, self.bi_graph = raw_graph
         
-        # Load CIR trends if provided
-        self.trends = trends
-        if self.trends is not None:
-            self.trend_ub, self.trend_ui, self.trend_bi = [t.to(device) for t in self.trends]
-            
-            # Extract indices and values for CAGCN propagation
-            self.ub_indices = self.trend_ub.indices()
-            self.ub_values = self.trend_ub.values() * self.trend_coeff
-            
-            self.ui_indices = self.trend_ui.indices()
-            self.ui_values = self.trend_ui.values() * self.trend_coeff
-            
-            self.bi_indices = self.trend_bi.indices()
-            self.bi_values = self.trend_bi.values() * self.trend_coeff
+        # CAGCN: Load trends
+        if hasattr(self.conf, "trends"):
+            self.trend_ub, self.trend_ui, self.trend_bi = self.conf["trends"]
+            # Ensure trends are on device
+            self.trend_ub = self.trend_ub.to(self.device)
+            self.trend_ui = self.trend_ui.to(self.device)
+            self.trend_bi = self.trend_bi.to(self.device)
+            print("CAGCN: Trends loaded successfully")
         else:
-            # Fallback to original logic if trends not provided (or error)
-            raise ValueError("CIR trends must be provided for CAGCN mode")
+            print("CAGCN Warning: No trends found in conf")
+            self.trend_ub = None
+            self.trend_ui = None
+            self.trend_bi = None
 
-        # CAGCN* Encoders for each view
-        self.encoder_ub = GraphConv_CA(self.num_layers)
-        self.encoder_ui = GraphConv_CA(self.num_layers)
-        self.encoder_bi = GraphConv_CA(self.num_layers)
-        
-        # Initialize propagation graphs (default: full graph without dropout)
-        # We need these to be available even if ED_drop=False (e.g. first epoch or eval)
-        self.UB_propagation_graph = self.get_propagation_graph(self.ub_graph)
-        self.UI_propagation_graph = self.get_propagation_graph(self.ui_graph)
-        self.BI_propagation_graph = self.get_propagation_graph(self.bi_graph)
-        
-        # Also need aggregation graphs for UI/BI
-        self.UI_aggregation_graph = self.get_aggregation_graph(self.ui_graph)
-        self.BI_aggregation_graph = self.get_aggregation_graph(self.bi_graph)
+        # generate the graph without any dropouts for testing
+        self.UB_propagation_graph_ori = self.get_propagation_graph(self.ub_graph)
+
+        self.UI_propagation_graph_ori = self.get_propagation_graph(self.ui_graph)
+        self.UI_aggregation_graph_ori = self.get_aggregation_graph(self.ui_graph)
+
+        self.BI_propagation_graph_ori = self.get_propagation_graph(self.bi_graph)
+        self.BI_aggregation_graph_ori = self.get_aggregation_graph(self.bi_graph)
+
+        # generate the graph with the configured dropouts for training, if aug_type is OP or MD, the following graphs with be identical with the aboves
+        self.UB_propagation_graph = self.get_propagation_graph(self.ub_graph, self.conf["UB_ratio"])
+
+        self.UI_propagation_graph = self.get_propagation_graph(self.ui_graph, self.conf["UI_ratio"])
+        self.UI_aggregation_graph = self.get_aggregation_graph(self.ui_graph, self.conf["UI_ratio"])
+
+        self.BI_propagation_graph = self.get_propagation_graph(self.bi_graph, self.conf["BI_ratio"])
+        self.BI_aggregation_graph = self.get_aggregation_graph(self.bi_graph, self.conf["BI_ratio"])
 
         if self.conf['aug_type'] == 'MD':
             self.init_md_dropouts()
@@ -236,124 +161,79 @@ class MultiCBR(nn.Module):
         self.BI_layer_coefs = BI_layer_coefs.unsqueeze(0).unsqueeze(-1).to(self.device)
 
 
-    def propagate_cagcn(self, encoder, A_feature, B_feature, indices, values, graph_type, layer_coef, test, original_graph=None):
-        # Concatenate features: [A; B]
+    def get_propagation_graph(self, bipartite_graph, modification_ratio=0):
+        device = self.device
+        propagation_graph = sp.bmat([[sp.csr_matrix((bipartite_graph.shape[0], bipartite_graph.shape[0])), bipartite_graph], [bipartite_graph.T, sp.csr_matrix((bipartite_graph.shape[1], bipartite_graph.shape[1]))]])
+
+        if modification_ratio != 0:
+            if self.conf["aug_type"] == "ED":
+                graph = propagation_graph.tocoo()
+                values = np_edge_dropout(graph.data, modification_ratio)
+                propagation_graph = sp.coo_matrix((values, (graph.row, graph.col)), shape=graph.shape).tocsr()
+
+        return to_tensor(laplace_transform(propagation_graph)).to(device)
+
+
+    def get_aggregation_graph(self, bipartite_graph, modification_ratio=0):
+        device = self.device
+
+        if modification_ratio != 0:
+            if self.conf["aug_type"] == "ED":
+                graph = bipartite_graph.tocoo()
+                values = np_edge_dropout(graph.data, modification_ratio)
+                bipartite_graph = sp.coo_matrix((values, (graph.row, graph.col)), shape=graph.shape).tocsr()
+
+        bundle_size = bipartite_graph.sum(axis=1) + 1e-8
+        bipartite_graph = sp.diags(1/bundle_size.A.ravel()) @ bipartite_graph
+        return to_tensor(bipartite_graph).to(device)
+
+
+    def propagate(self, graph, A_feature, B_feature, graph_type, layer_coef, test):
         features = torch.cat((A_feature, B_feature), 0)
-        
-        # 1. CAGCN Trend Propagation
-        # all_features_list is [embed_0, embed_1, ...]
-        trend_features_list = encoder(features, indices, values)
-        
-        # 2. Original Graph Propagation (LightGCN style)
-        # If original_graph is provided, we use it to propagate as well.
-        # This ensures we don't lose the collaborative signal.
-        # Original graph is usually normalized adjacency.
-        
-        final_features_list = []
-        
-        # We need to manually propagate on original graph if provided
-        if original_graph is not None:
-            curr_features = features
-            origin_features_list = [curr_features]
-            for i in range(self.num_layers):
-                # spmm: sparse matrix multiplication
-                # original_graph is torch.sparse_coo_tensor
-                curr_features = torch.sparse.mm(original_graph, curr_features)
-                origin_features_list.append(F.normalize(curr_features, p=2, dim=1))
-                
-            # Fuse: Origin + Trend
-            # Note: trend_features_list[0] is just input features, same as origin_features_list[0]
-            for i in range(len(trend_features_list)):
-                # Simple addition: Origin + Trend
-                # Since values in trend already multiplied by trend_coeff
-                fused = origin_features_list[i] + trend_features_list[i]
-                final_features_list.append(fused)
-                
-                # DEBUG MODE: Only use Original Graph
-                # final_features_list.append(origin_features_list[i])
-        else:
-            # Fallback (should not happen in this fix)
-            final_features_list = trend_features_list
+        all_features = [features]
 
-        # Layer Aggregation (MultiCBR logic)
-        # layer_coef: [1, 1, 1, num_layers+1]
-        # We stack features: [num_layers+1, n_nodes, emb_size]
-        all_features = torch.stack(final_features_list, dim=0)
+        for i in range(self.num_layers):
+            features = torch.spmm(graph, features)
+            if self.conf["aug_type"] == "MD" and not test:
+                mess_dropout = self.mess_dropout_dict[graph_type]
+                features = mess_dropout(features)
+            elif self.conf["aug_type"] == "Noise" and not test:
+                random_noise = torch.rand_like(features).to(self.device)
+                eps = self.eps_dict[graph_type]
+                features += torch.sign(features) * F.normalize(random_noise, dim=-1) * eps
+
+            all_features.append(F.normalize(features, p=2, dim=1))
+
+        all_features = torch.stack(all_features, 1) * layer_coef
+        all_features = torch.sum(all_features, dim=1)
+        A_feature, B_feature = torch.split(all_features, (A_feature.shape[0], B_feature.shape[0]), 0)
+
+        return A_feature, B_feature
+    
+    
+    def propagate_trend(self, trend_graph, A_feature, B_feature):
+        # CAGCN Plugin: Propagate using trend graph (Simple GCN)
+        if trend_graph is None:
+            return torch.zeros_like(A_feature), torch.zeros_like(B_feature)
+            
+        features = torch.cat((A_feature, B_feature), 0)
+        # One layer propagation for trend
+        # Ensure device match
+        if features.device != trend_graph.device:
+            trend_graph = trend_graph.to(features.device)
+            
+        trend_features = torch.spmm(trend_graph, features)
+        # Normalize?
+        trend_features = F.normalize(trend_features, p=2, dim=1)
         
-        # Weighted sum of layers
-        # layer_coef is [1, 1, 1, L+1], broadcast to [L+1, N, D]
-        # permute layer_coef to [L+1, 1, 1] for broadcasting?
-        # In init: self.UB_layer_coefs = UB_layer_coefs.unsqueeze(0).unsqueeze(-1) -> [1, L+1, 1]
-        # Wait, init says: unsqueeze(0).unsqueeze(-1). 
-        # fusion_weights['UB_layer'] length is L+1.
-        # So shape is [1, L+1, 1].
-        # We need to permute features to [1, L+1, N, D] or just sum over dim 0?
-        
-        # MultiCBR original logic likely sums:
-        # agg_feature = sum(feat[i] * w[i])
-        
-        # Let's check init again:
-        # self.UB_layer_coefs = UB_layer_coefs.unsqueeze(0).unsqueeze(-1) -> [1, L+1, 1] ??
-        # No, UB_layer_coefs is 1D tensor of size L+1.
-        # unsqueeze(0) -> [1, L+1]
-        # unsqueeze(-1) -> [1, L+1, 1]
-        # This seems designed for [Batch, Layer, Emb] ? No.
-        
-        # Let's assume standard weighted sum:
-        # all_features: [L+1, N, D]
-        # coef: [1, L+1, 1] -> squeeze(0) -> [L+1, 1]
-        
-        coef = layer_coef.squeeze(0) # [L+1, 1]
-        
-        # Weighted sum along layer dimension (0)
-        # all_features * coef: broadcasting [L+1, N, D] * [L+1, 1, 1]
-        out = torch.sum(all_features * coef.unsqueeze(-1), dim=0)
-        
-        # Split back to A and B
-        dim_A = A_feature.shape[0]
-        A_out = out[:dim_A]
-        B_out = out[dim_A:]
-        
-        return A_out, B_out
+        A_trend, B_trend = torch.split(trend_features, (A_feature.shape[0], B_feature.shape[0]), 0)
+        return A_trend, B_trend
 
 
-    def aggregate_cagcn(self, node_feature, indices, values, target_dim, source_dim, graph_type, test, original_graph=None):
-        # Aggregate from Source -> Target
-        # Dual Stream Aggregation:
-        # 1. Original Aggregation (using original_graph)
-        # 2. Trend Aggregation (using indices, values)
+    def aggregate(self, agg_graph, node_feature, graph_type, test):
+        aggregated_feature = torch.matmul(agg_graph, node_feature)
 
-        aggregated_feature_trend = None
-        aggregated_feature_origin = None
-
-        # --- Stream 1: Trend Aggregation ---
-        zeros = torch.zeros(target_dim, node_feature.shape[1]).to(self.device)
-        full_feature = torch.cat([zeros, node_feature], 0)
-        
-        row, col = indices
-        
-        # One step propagation
-        # out[e] = feature[row[e]] * value[e]
-        out = full_feature[row] * values.unsqueeze(-1)
-        agg_full = scatter_sum(out, col, dim_size=target_dim + source_dim)
-        
-        aggregated_feature_trend = agg_full[:target_dim]
-
-        # --- Stream 2: Original Aggregation ---
-        if original_graph is not None:
-             # original_graph is typically (Target x Source) or similar?
-             # MultiCBR RAW uses `aggregate` function:
-             # aggregated_feature = torch.matmul(agg_graph, node_feature)
-             aggregated_feature_origin = torch.matmul(original_graph, node_feature)
-        
-        # --- Fusion ---
-        if aggregated_feature_origin is not None:
-             # Fuse: Origin + Trend
-             aggregated_feature = aggregated_feature_origin + aggregated_feature_trend
-        else:
-             aggregated_feature = aggregated_feature_trend
-        
-        # Apply Dropout/Noise (Aligned with RAW logic)
+        # simple embedding dropout on bundle embeddings
         if self.conf["aug_type"] == "MD" and not test:
             mess_dropout = self.mess_dropout_dict[graph_type]
             aggregated_feature = mess_dropout(aggregated_feature)
@@ -378,41 +258,45 @@ class MultiCBR(nn.Module):
 
     def get_multi_modal_representations(self, test=False):
         #  =============================  UB graph propagation  =============================
-        UB_users_feature, UB_bundles_feature = self.propagate_cagcn(
-            self.encoder_ub, self.users_feature, self.bundles_feature, 
-            self.ub_indices, self.ub_values, "UB", self.UB_layer_coefs, test,
-            original_graph=self.UB_propagation_graph
-        )
+        if test:
+            UB_users_feature, UB_bundles_feature = self.propagate(self.UB_propagation_graph_ori, self.users_feature, self.bundles_feature, "UB", self.UB_layer_coefs, test)
+        else:
+            UB_users_feature, UB_bundles_feature = self.propagate(self.UB_propagation_graph, self.users_feature, self.bundles_feature, "UB", self.UB_layer_coefs, test)
+        
+        # CAGCN Plugin: UB Trend
+        if self.trend_ub is not None:
+            UB_trend_u, UB_trend_b = self.propagate_trend(self.trend_ub, self.users_feature, self.bundles_feature)
+            UB_users_feature = UB_users_feature + self.trend_coeff * UB_trend_u
+            UB_bundles_feature = UB_bundles_feature + self.trend_coeff * UB_trend_b
 
         #  =============================  UI graph propagation  =============================
-        UI_users_feature, UI_items_feature = self.propagate_cagcn(
-            self.encoder_ui, self.users_feature, self.items_feature, 
-            self.ui_indices, self.ui_values, "UI", self.UI_layer_coefs, test,
-            original_graph=self.UI_propagation_graph
-        )
-        
-        # Aggregate Items -> Bundles (using BI graph structure)
-        # BI graph: Bundles (Rows), Items (Cols)
-        UI_bundles_feature = self.aggregate_cagcn(
-            UI_items_feature, self.bi_indices, self.bi_values, 
-            self.num_bundles, self.num_items, "BI", test,
-            original_graph=self.BI_aggregation_graph
-        )
+        if test:
+            UI_users_feature, UI_items_feature = self.propagate(self.UI_propagation_graph_ori, self.users_feature, self.items_feature, "UI", self.UI_layer_coefs, test)
+            UI_bundles_feature = self.aggregate(self.BI_aggregation_graph_ori, UI_items_feature, "BI", test)
+        else:
+            UI_users_feature, UI_items_feature = self.propagate(self.UI_propagation_graph, self.users_feature, self.items_feature, "UI", self.UI_layer_coefs, test)
+            UI_bundles_feature = self.aggregate(self.BI_aggregation_graph, UI_items_feature, "BI", test)
+            
+        # CAGCN Plugin: UI Trend (Only add to users, items are intermediate)
+        if self.trend_ui is not None:
+            UI_trend_u, UI_trend_i = self.propagate_trend(self.trend_ui, self.users_feature, self.items_feature)
+            UI_users_feature = UI_users_feature + self.trend_coeff * UI_trend_u
+            # We don't propagate trend to UI_bundles_feature directly as it comes from aggregation
+            # But we could trend-enhance the items before aggregation?
+            # Let's keep it simple: Only enhance final node representations
 
         #  =============================  BI graph propagation  =============================
-        BI_bundles_feature, BI_items_feature = self.propagate_cagcn(
-            self.encoder_bi, self.bundles_feature, self.items_feature, 
-            self.bi_indices, self.bi_values, "BI", self.BI_layer_coefs, test,
-            original_graph=self.BI_propagation_graph
-        )
-        
-        # Aggregate Items -> Users (using UI graph structure)
-        # UI graph: Users (Rows), Items (Cols)
-        BI_users_feature = self.aggregate_cagcn(
-            BI_items_feature, self.ui_indices, self.ui_values, 
-            self.num_users, self.num_items, "UI", test,
-            original_graph=self.UI_aggregation_graph
-        )
+        if test:
+            BI_bundles_feature, BI_items_feature = self.propagate(self.BI_propagation_graph_ori, self.bundles_feature, self.items_feature, "BI", self.BI_layer_coefs, test)
+            BI_users_feature = self.aggregate(self.UI_aggregation_graph_ori, BI_items_feature, "UI", test)
+        else:
+            BI_bundles_feature, BI_items_feature = self.propagate(self.BI_propagation_graph, self.bundles_feature, self.items_feature, "BI", self.BI_layer_coefs, test)
+            BI_users_feature = self.aggregate(self.UI_aggregation_graph, BI_items_feature, "UI", test)
+            
+        # CAGCN Plugin: BI Trend
+        if self.trend_bi is not None:
+            BI_trend_b, BI_trend_i = self.propagate_trend(self.trend_bi, self.bundles_feature, self.items_feature)
+            BI_bundles_feature = BI_bundles_feature + self.trend_coeff * BI_trend_b
 
         users_feature = [UB_users_feature, UI_users_feature, BI_users_feature]
         bundles_feature = [UB_bundles_feature, UI_bundles_feature, BI_bundles_feature]
