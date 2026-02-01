@@ -84,6 +84,69 @@ class GraphConv_CA(nn.Module):
 
 
 class MultiCBR(nn.Module):
+    def get_sparse_laplacian(self, graph, norm=True):
+        # graph is (M, N) scipy.sparse csr_matrix
+        # We want to build symmetric Laplacian of size (M+N, M+N)
+        M, N = graph.shape
+        
+        # Build adjacency matrix:
+        # A = [[0, R], 
+        #      [R.T, 0]]
+        
+        # Convert to COO for easy manipulation
+        graph_coo = graph.tocoo()
+        
+        # Original edges: R[i, j]
+        rows = graph_coo.row
+        cols = graph_coo.col
+        
+        # New indices for block matrix
+        # Block (0, 1): rows [0, M), cols [M, M+N)
+        # Block (1, 0): rows [M, M+N), cols [0, M)
+        
+        # Upper right block
+        upper_rows = rows
+        upper_cols = cols + M
+        
+        # Lower left block
+        lower_rows = cols + M
+        lower_cols = rows
+        
+        # Combine
+        all_rows = np.concatenate([upper_rows, lower_rows])
+        all_cols = np.concatenate([upper_cols, lower_cols])
+        all_data = np.concatenate([graph_coo.data, graph_coo.data])
+        
+        if norm:
+            # Calculate degrees
+            # We can use scipy logic
+            adj = sp.coo_matrix((all_data, (all_rows, all_cols)), shape=(M+N, M+N))
+            row_sum = np.array(adj.sum(1))
+            d_inv_sqrt = np.power(row_sum, -0.5).flatten()
+            d_inv_sqrt[np.isinf(d_inv_sqrt)] = 0.
+            d_mat_inv_sqrt = sp.diags(d_inv_sqrt)
+            
+            # L = D^-0.5 * A * D^-0.5
+            bi_lap = d_mat_inv_sqrt.dot(adj).dot(d_mat_inv_sqrt)
+            
+            # Convert to torch sparse tensor
+            bi_lap = bi_lap.tocoo()
+            indices = np.vstack((bi_lap.row, bi_lap.col))
+            values = bi_lap.data
+            
+            i = torch.LongTensor(indices)
+            v = torch.FloatTensor(values)
+            shape = torch.Size(bi_lap.shape)
+            
+            return torch.sparse_coo_tensor(i, v, shape)
+        else:
+             # Just adjacency
+             i = torch.LongTensor(np.vstack((all_rows, all_cols)))
+             v = torch.FloatTensor(all_data)
+             shape = torch.Size((M+N, M+N))
+             return torch.sparse_coo_tensor(i, v, shape)
+
+
     def __init__(self, conf, raw_graph, trends=None):
         super().__init__()
         self.conf = conf
@@ -132,9 +195,10 @@ class MultiCBR(nn.Module):
         
         # Initialize propagation graphs (default: full graph without dropout)
         # We need these to be available even if ED_drop=False (e.g. first epoch or eval)
-        self.UB_propagation_graph = to_tensor(self.ub_graph).to(self.device)
-        self.UI_propagation_graph = to_tensor(self.ui_graph).to(self.device)
-        self.BI_propagation_graph = to_tensor(self.bi_graph).to(self.device)
+        # Use get_sparse_laplacian to build symmetric normalized adjacency matrix
+        self.UB_propagation_graph = self.get_sparse_laplacian(self.ub_graph).to(self.device)
+        self.UI_propagation_graph = self.get_sparse_laplacian(self.ui_graph).to(self.device)
+        self.BI_propagation_graph = self.get_sparse_laplacian(self.bi_graph).to(self.device)
 
         if self.conf['aug_type'] == 'MD':
             self.init_md_dropouts()
