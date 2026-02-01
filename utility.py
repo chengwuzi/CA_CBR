@@ -324,6 +324,10 @@ class Datasets():
             for i in range(0, n_row, batch_size):
                 end_i = min(i + batch_size, n_row)
                 
+                # Print progress every 10%
+                if i % (batch_size * 5) == 0:
+                     print(f"  > Processing rows {i}/{n_row} ({i/n_row*100:.1f}%)")
+
                 # 1. Get block from scipy csr (slicing is fast)
                 # A_block_scipy = adj_csr[i:end_i]
                 # Convert to dense torch tensor directly
