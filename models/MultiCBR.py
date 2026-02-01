@@ -204,44 +204,82 @@ class MultiCBR(nn.Module):
         self.BI_layer_coefs = BI_layer_coefs.unsqueeze(0).unsqueeze(-1).to(self.device)
 
 
-    def propagate_cagcn(self, encoder, A_feature, B_feature, indices, values, graph_type, layer_coef, test):
+    def propagate_cagcn(self, encoder, A_feature, B_feature, indices, values, graph_type, layer_coef, test, original_graph=None):
         # Concatenate features: [A; B]
         features = torch.cat((A_feature, B_feature), 0)
         
-        # CAGCN Propagation
-        all_features_list = encoder(features, indices, values)
+        # 1. CAGCN Trend Propagation
         # all_features_list is [embed_0, embed_1, ...]
+        trend_features_list = encoder(features, indices, values)
         
-        # Apply Dropout/Noise if needed (on intermediate layers?)
-        # MultiCBR applies dropout AFTER propagation loop on the FINAL aggregated feature?
-        # No, MultiCBR propagate:
-        # for i in range(num_layers):
-        #    features = spmm(features)
-        #    if dropout: features = dropout(features)
-        #    all_features.append(features)
-        # We need to inject dropout into the list
+        # 2. Original Graph Propagation (LightGCN style)
+        # If original_graph is provided, we use it to propagate as well.
+        # This ensures we don't lose the collaborative signal.
+        # Original graph is usually normalized adjacency.
         
-        processed_features = [all_features_list[0]] # embed_0 (no dropout)
+        final_features_list = []
         
-        for i in range(1, len(all_features_list)):
-            feat = all_features_list[i]
-            if self.conf["aug_type"] == "MD" and not test:
-                mess_dropout = self.mess_dropout_dict[graph_type]
-                feat = mess_dropout(feat)
-            elif self.conf["aug_type"] == "Noise" and not test:
-                random_noise = torch.rand_like(feat).to(self.device)
-                eps = self.eps_dict[graph_type]
-                feat += torch.sign(feat) * F.normalize(random_noise, dim=-1) * eps
-            processed_features.append(feat)
+        # We need to manually propagate on original graph if provided
+        if original_graph is not None:
+            curr_features = features
+            origin_features_list = [curr_features]
+            for i in range(self.num_layers):
+                # spmm: sparse matrix multiplication
+                # original_graph is torch.sparse_coo_tensor
+                curr_features = torch.sparse.mm(original_graph, curr_features)
+                origin_features_list.append(F.normalize(curr_features, p=2, dim=1))
+                
+            # Fuse: Origin + Trend
+            # Note: trend_features_list[0] is just input features, same as origin_features_list[0]
+            for i in range(len(trend_features_list)):
+                # Simple addition: Origin + Trend
+                # Since values in trend already multiplied by trend_coeff
+                fused = origin_features_list[i] + trend_features_list[i]
+                final_features_list.append(fused)
+        else:
+            # Fallback (should not happen in this fix)
+            final_features_list = trend_features_list
 
-        # Layer Fusion
-        # stack: [N, num_layers+1, D]
-        all_features = torch.stack(processed_features, 1) * layer_coef
-        all_features = torch.sum(all_features, dim=1)
+        # Layer Aggregation (MultiCBR logic)
+        # layer_coef: [1, 1, 1, num_layers+1]
+        # We stack features: [num_layers+1, n_nodes, emb_size]
+        all_features = torch.stack(final_features_list, dim=0)
         
-        A_feature, B_feature = torch.split(all_features, (A_feature.shape[0], B_feature.shape[0]), 0)
-
-        return A_feature, B_feature
+        # Weighted sum of layers
+        # layer_coef is [1, 1, 1, L+1], broadcast to [L+1, N, D]
+        # permute layer_coef to [L+1, 1, 1] for broadcasting?
+        # In init: self.UB_layer_coefs = UB_layer_coefs.unsqueeze(0).unsqueeze(-1) -> [1, L+1, 1]
+        # Wait, init says: unsqueeze(0).unsqueeze(-1). 
+        # fusion_weights['UB_layer'] length is L+1.
+        # So shape is [1, L+1, 1].
+        # We need to permute features to [1, L+1, N, D] or just sum over dim 0?
+        
+        # MultiCBR original logic likely sums:
+        # agg_feature = sum(feat[i] * w[i])
+        
+        # Let's check init again:
+        # self.UB_layer_coefs = UB_layer_coefs.unsqueeze(0).unsqueeze(-1) -> [1, L+1, 1] ??
+        # No, UB_layer_coefs is 1D tensor of size L+1.
+        # unsqueeze(0) -> [1, L+1]
+        # unsqueeze(-1) -> [1, L+1, 1]
+        # This seems designed for [Batch, Layer, Emb] ? No.
+        
+        # Let's assume standard weighted sum:
+        # all_features: [L+1, N, D]
+        # coef: [1, L+1, 1] -> squeeze(0) -> [L+1, 1]
+        
+        coef = layer_coef.squeeze(0) # [L+1, 1]
+        
+        # Weighted sum along layer dimension (0)
+        # all_features * coef: broadcasting [L+1, N, D] * [L+1, 1, 1]
+        out = torch.sum(all_features * coef.unsqueeze(-1), dim=0)
+        
+        # Split back to A and B
+        dim_A = A_feature.shape[0]
+        A_out = out[:dim_A]
+        B_out = out[dim_A:]
+        
+        return A_out, B_out
 
 
     def aggregate_cagcn(self, node_feature, indices, values, target_dim, source_dim, graph_type, test):
@@ -303,13 +341,15 @@ class MultiCBR(nn.Module):
         #  =============================  UB graph propagation  =============================
         UB_users_feature, UB_bundles_feature = self.propagate_cagcn(
             self.encoder_ub, self.users_feature, self.bundles_feature, 
-            self.ub_indices, self.ub_values, "UB", self.UB_layer_coefs, test
+            self.ub_indices, self.ub_values, "UB", self.UB_layer_coefs, test,
+            original_graph=self.UB_propagation_graph
         )
 
         #  =============================  UI graph propagation  =============================
         UI_users_feature, UI_items_feature = self.propagate_cagcn(
             self.encoder_ui, self.users_feature, self.items_feature, 
-            self.ui_indices, self.ui_values, "UI", self.UI_layer_coefs, test
+            self.ui_indices, self.ui_values, "UI", self.UI_layer_coefs, test,
+            original_graph=self.UI_propagation_graph
         )
         
         # Aggregate Items -> Bundles (using BI graph structure)
@@ -322,7 +362,8 @@ class MultiCBR(nn.Module):
         #  =============================  BI graph propagation  =============================
         BI_bundles_feature, BI_items_feature = self.propagate_cagcn(
             self.encoder_bi, self.bundles_feature, self.items_feature, 
-            self.bi_indices, self.bi_values, "BI", self.BI_layer_coefs, test
+            self.bi_indices, self.bi_values, "BI", self.BI_layer_coefs, test,
+            original_graph=self.BI_propagation_graph
         )
         
         # Aggregate Items -> Users (using UI graph structure)

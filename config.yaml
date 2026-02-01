@@ -35,7 +35,7 @@ NetEase:
 
   # CAGCN settings
   cagcn_type: "jc" # jc, sc, lhn, co
-  trend_coeff: 0.1
+  trend_coeff: 1.0
 
 
 iFashion:
@@ -71,7 +71,7 @@ iFashion:
 
   # CAGCN settings
   cagcn_type: "jc" # jc, sc, lhn, co
-  trend_coeff: 0.1
+  trend_coeff: 1.0
 
 
 Youshu:
@@ -107,4 +107,4 @@ Youshu:
 
   # CAGCN settings
   cagcn_type: "jc" # jc, sc, lhn, co
-  trend_coeff: 0.1
+  trend_coeff: 1.0

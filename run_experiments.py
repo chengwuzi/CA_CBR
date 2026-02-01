@@ -27,7 +27,7 @@ def main():
     else:
         cagcn_types = ["jc", "sc", "lhn", "co"]
         
-    trend_coeffs = [0.1] # Can expand later
+    trend_coeffs = [1.0] # Can expand later
     
     # Path to python interpreter
     # Use the current python interpreter executing this script
