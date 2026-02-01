@@ -72,15 +72,12 @@ class MultiCBR(nn.Module):
         self.ub_graph, self.ui_graph, self.bi_graph = raw_graph
         
         # CAGCN: Load trends
-        if hasattr(self.conf, "trends"):
+        if "trends" in self.conf and self.conf["trends"] is not None:
             self.trend_ub, self.trend_ui, self.trend_bi = self.conf["trends"]
-            # Ensure trends are on device
             self.trend_ub = self.trend_ub.to(self.device)
             self.trend_ui = self.trend_ui.to(self.device)
             self.trend_bi = self.trend_bi.to(self.device)
-            print("CAGCN: Trends loaded successfully")
         else:
-            print("CAGCN Warning: No trends found in conf")
             self.trend_ub = None
             self.trend_ui = None
             self.trend_bi = None
