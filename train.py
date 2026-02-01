@@ -52,6 +52,11 @@ def main():
     conf["num_items"] = dataset.num_items
 
     os.environ['CUDA_VISIBLE_DEVICES'] = conf["gpu"]
+    
+    if not torch.cuda.is_available() and conf["gpu"] != "-1":
+         print(f"Warning: CUDA not available even though gpu={conf['gpu']} is requested.")
+         # Force check again in case environment variable change needs refresh (rarely works in same process but good for debug)
+
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     conf["device"] = device
     
@@ -113,6 +118,12 @@ def main():
         settings += [str(c_lambda), str(c_temp)]
 
         setting = "_".join(settings)
+        # Limit the length of the log path to avoid Windows MAX_PATH issue
+        if len(setting) > 100:
+            import hashlib
+            hash_object = hashlib.md5(setting.encode())
+            setting = setting[:50] + "_" + hash_object.hexdigest()[:8]
+
         log_path = log_path + "/" + setting
         run_path = run_path + "/" + setting
         checkpoint_model_path = checkpoint_model_path + "/" + setting
