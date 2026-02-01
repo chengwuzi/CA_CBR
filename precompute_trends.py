@@ -4,6 +4,53 @@ import yaml
 import torch
 from utility import Datasets
 
+def get_user_choice():
+    print("\n" + "="*50)
+    print("MultiCBR Trend Precomputer - Interactive Mode")
+    print("="*50)
+    
+    # Select Dataset
+    datasets = ["NetEase", "iFashion", "Youshu"]
+    print("\nAvailable Datasets:")
+    for i, d in enumerate(datasets):
+        print(f"  [{i+1}] {d}")
+    print(f"  [{len(datasets)+1}] ALL Datasets")
+    
+    while True:
+        try:
+            d_idx = int(input("\nSelect Dataset (Input number): ")) - 1
+            if d_idx == len(datasets):
+                selected_datasets = datasets
+                break
+            if 0 <= d_idx < len(datasets):
+                selected_datasets = [datasets[d_idx]]
+                break
+            print("Invalid selection. Try again.")
+        except ValueError:
+            print("Please input a number.")
+
+    # Select Metric
+    cagcn_types = ["jc", "sc", "lhn", "co"]
+    print("\nAvailable Metrics:")
+    for i, m in enumerate(cagcn_types):
+        print(f"  [{i+1}] {m.upper()}")
+    print(f"  [{len(cagcn_types)+1}] ALL Metrics")
+    
+    while True:
+        try:
+            m_idx = int(input("\nSelect Metric (Input number): ")) - 1
+            if m_idx == len(cagcn_types):
+                selected_metrics = cagcn_types
+                break
+            if 0 <= m_idx < len(cagcn_types):
+                selected_metrics = [cagcn_types[m_idx]]
+                break
+            print("Invalid selection. Try again.")
+        except ValueError:
+            print("Please input a number.")
+            
+    return selected_datasets, selected_metrics
+
 def precompute_trends():
     """
     Standalone script to precompute CIR trends (jc, sc, lhn, co) for all datasets.
@@ -11,15 +58,18 @@ def precompute_trends():
     Then upload the 'datasets' folder to your training server.
     """
     
-    # Define experiment space
-    datasets = ["NetEase", "iFashion", "Youshu"]
-    cagcn_types = ["jc", "sc", "lhn", "co"]
+    # Get user choices
+    target_datasets, target_metrics = get_user_choice()
+    
+    print("\n" + "-"*50)
+    print(f"Plan: Process {target_datasets} with metrics {target_metrics}")
+    print("-"*50 + "\n")
     
     # Load base config to initialize Datasets class
     with open("./config.yaml", "r") as f:
         base_conf = yaml.safe_load(f)
 
-    for dataset_name in datasets:
+    for dataset_name in target_datasets:
         print(f"\n{'='*50}")
         print(f"Processing Dataset: {dataset_name}")
         print(f"{'='*50}")
@@ -37,7 +87,7 @@ def precompute_trends():
         dataset = Datasets(conf)
         
         # Calculate trends for all types
-        for c_type in cagcn_types:
+        for c_type in target_metrics:
             print(f"\n>> Calculating {c_type.upper()} trends for {dataset_name}...")
             
             # 1. UB Graph
@@ -62,7 +112,7 @@ def precompute_trends():
             else:
                 dataset.get_cir_trend(dataset.b_i_graph_train, c_type, 'bi')
 
-    print("\n\nAll trends computed! Please copy the 'datasets' folder to your server.")
+    print("\n\nAll selected trends computed! Please copy the 'datasets' folder to your server.")
 
 if __name__ == "__main__":
     precompute_trends()
