@@ -36,6 +36,14 @@ def cal_bpr_loss(pred):
     return loss
 
 
+def laplace_transform(graph):
+    rowsum_sqrt = sp.diags(1/(np.sqrt(graph.sum(axis=1).A.ravel()) + 1e-8))
+    colsum_sqrt = sp.diags(1/(np.sqrt(graph.sum(axis=0).A.ravel()) + 1e-8))
+    graph = rowsum_sqrt @ graph @ colsum_sqrt
+
+    return graph
+
+
 def to_tensor(graph):
     graph = graph.tocoo()
     values = graph.data
@@ -84,67 +92,31 @@ class GraphConv_CA(nn.Module):
 
 
 class MultiCBR(nn.Module):
-    def get_sparse_laplacian(self, graph, norm=True):
-        # graph is (M, N) scipy.sparse csr_matrix
-        # We want to build symmetric Laplacian of size (M+N, M+N)
-        M, N = graph.shape
-        
-        # Build adjacency matrix:
-        # A = [[0, R], 
-        #      [R.T, 0]]
-        
-        # Convert to COO for easy manipulation
-        graph_coo = graph.tocoo()
-        
-        # Original edges: R[i, j]
-        rows = graph_coo.row
-        cols = graph_coo.col
-        
-        # New indices for block matrix
-        # Block (0, 1): rows [0, M), cols [M, M+N)
-        # Block (1, 0): rows [M, M+N), cols [0, M)
-        
-        # Upper right block
-        upper_rows = rows
-        upper_cols = cols + M
-        
-        # Lower left block
-        lower_rows = cols + M
-        lower_cols = rows
-        
-        # Combine
-        all_rows = np.concatenate([upper_rows, lower_rows])
-        all_cols = np.concatenate([upper_cols, lower_cols])
-        all_data = np.concatenate([graph_coo.data, graph_coo.data])
-        
-        if norm:
-            # Calculate degrees
-            # We can use scipy logic
-            adj = sp.coo_matrix((all_data, (all_rows, all_cols)), shape=(M+N, M+N))
-            row_sum = np.array(adj.sum(1))
-            d_inv_sqrt = np.power(row_sum, -0.5).flatten()
-            d_inv_sqrt[np.isinf(d_inv_sqrt)] = 0.
-            d_mat_inv_sqrt = sp.diags(d_inv_sqrt)
-            
-            # L = D^-0.5 * A * D^-0.5
-            bi_lap = d_mat_inv_sqrt.dot(adj).dot(d_mat_inv_sqrt)
-            
-            # Convert to torch sparse tensor
-            bi_lap = bi_lap.tocoo()
-            indices = np.vstack((bi_lap.row, bi_lap.col))
-            values = bi_lap.data
-            
-            i = torch.LongTensor(indices)
-            v = torch.FloatTensor(values)
-            shape = torch.Size(bi_lap.shape)
-            
-            return torch.sparse_coo_tensor(i, v, shape)
-        else:
-             # Just adjacency
-             i = torch.LongTensor(np.vstack((all_rows, all_cols)))
-             v = torch.FloatTensor(all_data)
-             shape = torch.Size((M+N, M+N))
-             return torch.sparse_coo_tensor(i, v, shape)
+    def get_propagation_graph(self, bipartite_graph, modification_ratio=0):
+        device = self.device
+        propagation_graph = sp.bmat([[sp.csr_matrix((bipartite_graph.shape[0], bipartite_graph.shape[0])), bipartite_graph], [bipartite_graph.T, sp.csr_matrix((bipartite_graph.shape[1], bipartite_graph.shape[1]))]])
+
+        if modification_ratio != 0:
+            if self.conf["aug_type"] == "ED":
+                graph = propagation_graph.tocoo()
+                values = np_edge_dropout(graph.data, modification_ratio)
+                propagation_graph = sp.coo_matrix((values, (graph.row, graph.col)), shape=graph.shape).tocsr()
+
+        return to_tensor(laplace_transform(propagation_graph)).to(device)
+
+
+    def get_aggregation_graph(self, bipartite_graph, modification_ratio=0):
+        device = self.device
+
+        if modification_ratio != 0:
+            if self.conf["aug_type"] == "ED":
+                graph = bipartite_graph.tocoo()
+                values = np_edge_dropout(graph.data, modification_ratio)
+                bipartite_graph = sp.coo_matrix((values, (graph.row, graph.col)), shape=graph.shape).tocsr()
+
+        bundle_size = bipartite_graph.sum(axis=1) + 1e-8
+        bipartite_graph = sp.diags(1/bundle_size.A.ravel()) @ bipartite_graph
+        return to_tensor(bipartite_graph).to(device)
 
 
     def __init__(self, conf, raw_graph, trends=None):
@@ -195,10 +167,13 @@ class MultiCBR(nn.Module):
         
         # Initialize propagation graphs (default: full graph without dropout)
         # We need these to be available even if ED_drop=False (e.g. first epoch or eval)
-        # Use get_sparse_laplacian to build symmetric normalized adjacency matrix
-        self.UB_propagation_graph = self.get_sparse_laplacian(self.ub_graph).to(self.device)
-        self.UI_propagation_graph = self.get_sparse_laplacian(self.ui_graph).to(self.device)
-        self.BI_propagation_graph = self.get_sparse_laplacian(self.bi_graph).to(self.device)
+        self.UB_propagation_graph = self.get_propagation_graph(self.ub_graph)
+        self.UI_propagation_graph = self.get_propagation_graph(self.ui_graph)
+        self.BI_propagation_graph = self.get_propagation_graph(self.bi_graph)
+        
+        # Also need aggregation graphs for UI/BI
+        self.UI_aggregation_graph = self.get_aggregation_graph(self.ui_graph)
+        self.BI_aggregation_graph = self.get_aggregation_graph(self.bi_graph)
 
         if self.conf['aug_type'] == 'MD':
             self.init_md_dropouts()
