@@ -177,7 +177,84 @@ class Datasets():
         path = os.path.join(self.path, self.name, 'trend_{}_{}.pt'.format(name, type))
         if os.path.exists(path):
             print(f'Loading precomputed trend for {name} ({type}) from {path}')
-            return torch.load(path)
+            trend_sparse = torch.load(path)
+            
+            # === Post-hoc Top-K Sparsification (Load-time) ===
+            # If the graph is too dense, we sparsify it on the fly.
+            # This avoids re-calculating the expensive CIR matrix.
+            k = 10 # Default Top-K
+            
+            # Check density roughly (avg degree)
+            num_nodes = trend_sparse.shape[0]
+            num_edges = trend_sparse._nnz()
+            avg_deg = num_edges / num_nodes
+            
+            if avg_deg > k * 1.5: # If significantly denser than K
+                print(f"  > Trend graph is dense (avg_deg={avg_deg:.1f}), applying Top-{k} sparsification...")
+                
+                # Convert to coalesce to ensure indices are sorted/unique
+                trend_sparse = trend_sparse.coalesce()
+                indices = trend_sparse.indices()
+                values = trend_sparse.values()
+                
+                # To do Top-K per row efficiently on sparse tensor is tricky in PyTorch.
+                # But since we loaded it, let's try a row-wise approach.
+                # Convert to CSR representation for fast row slicing
+                # PyTorch sparse CSR is supported in newer versions, but let's be safe.
+                # We can iterate over rows using a simple loop if N is not too huge, 
+                # or use a scatter/sort trick.
+                
+                # Fast Top-K on Sparse Matrix:
+                # 1. Convert to Scipy CSR (CPU) -> easy slicing
+                rows = indices[0].cpu().numpy()
+                cols = indices[1].cpu().numpy()
+                data = values.cpu().numpy()
+                
+                import scipy.sparse as sp
+                mat = sp.csr_matrix((data, (rows, cols)), shape=trend_sparse.shape)
+                
+                # 2. Iterate and pick Top-K
+                new_data = []
+                new_rows = []
+                new_cols = []
+                
+                # We can process in batches to be faster
+                # Or just iterate since it's one-time cost at startup
+                for i in range(mat.shape[0]):
+                    row_dat = mat.data[mat.indptr[i]:mat.indptr[i+1]]
+                    row_col = mat.indices[mat.indptr[i]:mat.indptr[i+1]]
+                    
+                    if len(row_dat) > k:
+                        # Get indices of top k elements
+                        # argpartition is faster than sort
+                        idx = np.argpartition(row_dat, -k)[-k:]
+                        new_data.append(row_dat[idx])
+                        new_rows.append(np.full(k, i))
+                        new_cols.append(row_col[idx])
+                    else:
+                        new_data.append(row_dat)
+                        new_rows.append(np.full(len(row_dat), i))
+                        new_cols.append(row_col)
+                        
+                # 3. Reconstruct
+                if len(new_data) > 0:
+                    new_data = np.concatenate(new_data)
+                    new_rows = np.concatenate(new_rows)
+                    new_cols = np.concatenate(new_cols)
+                    
+                    # Normalize again? 
+                    # Original code normalized by degree in calculation.
+                    # Let's keep values as is (Top-K selection).
+                    
+                    # To Tensor
+                    device = trend_sparse.device
+                    new_indices = torch.from_numpy(np.vstack((new_rows, new_cols))).long().to(device)
+                    new_values = torch.from_numpy(new_data).float().to(device)
+                    
+                    trend_sparse = torch.sparse_coo_tensor(new_indices, new_values, trend_sparse.shape).coalesce()
+                    print(f"  > Sparsification done. New avg_deg={trend_sparse._nnz()/num_nodes:.1f}")
+                
+            return trend_sparse
             
         print(f'Calculating trend for {name} ({type})...')
         
