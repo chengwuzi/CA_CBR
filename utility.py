@@ -80,6 +80,7 @@ class BundleTestDataset(Dataset):
 
 class Datasets():
     def __init__(self, conf):
+        self.conf = conf
         self.path = conf['data_path']
         self.name = conf['dataset']
         batch_size_train = conf['batch_size_train']

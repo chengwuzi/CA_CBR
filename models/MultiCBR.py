@@ -64,6 +64,14 @@ class MultiCBR(nn.Module):
         
         # CAGCN settings
         self.trend_coeff = conf.get("trend_coeff", 1.0)
+        self.trend_mix = conf.get("trend_mix", False)
+        self.trend_norm = conf.get("trend_norm", "row")
+        self.trend_mix_layers = conf.get("trend_mix_layers", -1)
+        self.trend_topk = conf.get("trend_topk", 0)
+        
+        self.trend_coeff_ub = conf.get("trend_coeff_ub", self.trend_coeff)
+        self.trend_coeff_ui = conf.get("trend_coeff_ui", self.trend_coeff)
+        self.trend_coeff_bi = conf.get("trend_coeff_bi", self.trend_coeff)
 
         self.init_emb()
         self.init_fusion_weights()
