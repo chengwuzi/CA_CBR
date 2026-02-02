@@ -48,7 +48,7 @@ NetEase:
   - 20
   - 40
   - 80
-  trend_coeff: 0.2
+  trend_coeff: 0.06
 Youshu:
   BI_ratios:
   - 0.1
@@ -99,7 +99,7 @@ Youshu:
   - 20
   - 40
   - 80
-  trend_coeff: 1.0
+  trend_coeff: 0.06
 iFashion:
   BI_ratios:
   - 0.15
@@ -150,4 +150,4 @@ iFashion:
   - 20
   - 40
   - 80
-  trend_coeff: 1.0
+  trend_coeff: 0.06
