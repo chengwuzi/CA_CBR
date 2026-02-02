@@ -49,6 +49,13 @@ NetEase:
   - 40
   - 80
   trend_coeff: 0.06
+  trend_mix: true
+  trend_norm: row
+  trend_topk: 0
+  trend_coeff_ub: 0.06
+  trend_coeff_ui: 0.06
+  trend_coeff_bi: 0.06
+  trend_mix_layers: -1
 Youshu:
   BI_ratios:
   - 0.1

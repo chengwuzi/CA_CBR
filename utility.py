@@ -177,7 +177,69 @@ class Datasets():
         path = os.path.join(self.path, self.name, 'trend_{}_{}.pt'.format(name, type))
         if os.path.exists(path):
             print(f'Loading precomputed trend for {name} ({type}) from {path}')
-            return torch.load(path)
+            trend_sparse = torch.load(path)
+            
+            # === Post-hoc Top-K Sparsification (Load-time) ===
+            # Only if trend_topk > 0
+            k = self.conf.get("trend_topk", 0)
+            
+            if k > 0:
+                # Check density roughly (avg degree)
+                num_nodes = trend_sparse.shape[0]
+                num_edges = trend_sparse._nnz()
+                avg_deg = num_edges / num_nodes
+                
+                # If significantly denser than K, we sparsify
+                # If avg_deg is already small, maybe no need? But let's force it if user asks.
+                if avg_deg > k: 
+                    print(f"  > Trend graph is dense (avg_deg={avg_deg:.1f}), applying Top-{k} sparsification...")
+                    
+                    # Convert to coalesce to ensure indices are sorted/unique
+                    trend_sparse = trend_sparse.coalesce()
+                    indices = trend_sparse.indices()
+                    values = trend_sparse.values()
+                    
+                    # Fast Top-K on Sparse Matrix via Scipy
+                    rows = indices[0].cpu().numpy()
+                    cols = indices[1].cpu().numpy()
+                    data = values.cpu().numpy()
+                    
+                    import scipy.sparse as sp
+                    mat = sp.csr_matrix((data, (rows, cols)), shape=trend_sparse.shape)
+                    
+                    new_data = []
+                    new_rows = []
+                    new_cols = []
+                    
+                    # Iterate rows
+                    for i in range(mat.shape[0]):
+                        row_dat = mat.data[mat.indptr[i]:mat.indptr[i+1]]
+                        row_col = mat.indices[mat.indptr[i]:mat.indptr[i+1]]
+                        
+                        if len(row_dat) > k:
+                            # Get indices of top k elements
+                            idx = np.argpartition(row_dat, -k)[-k:]
+                            new_data.append(row_dat[idx])
+                            new_rows.append(np.full(k, i))
+                            new_cols.append(row_col[idx])
+                        else:
+                            new_data.append(row_dat)
+                            new_rows.append(np.full(len(row_dat), i))
+                            new_cols.append(row_col)
+                            
+                    if len(new_data) > 0:
+                        new_data = np.concatenate(new_data)
+                        new_rows = np.concatenate(new_rows)
+                        new_cols = np.concatenate(new_cols)
+                        
+                        device = trend_sparse.device
+                        new_indices = torch.from_numpy(np.vstack((new_rows, new_cols))).long().to(device)
+                        new_values = torch.from_numpy(new_data).float().to(device)
+                        
+                        trend_sparse = torch.sparse_coo_tensor(new_indices, new_values, trend_sparse.shape).coalesce()
+                        print(f"  > Sparsification done. New avg_deg={trend_sparse._nnz()/num_nodes:.1f}")
+                
+            return trend_sparse
             
         print(f'Calculating trend for {name} ({type})...')
         
@@ -404,7 +466,7 @@ class Datasets():
                 # PyTorch: dense @ sparse -> dense.
                 # We calculate full W_block, then mask it.
                 
-                W_block = torch.matmul(S_block, A_full_sparse.to_dense() if A_full_sparse.is_sparse else A_full_sparse)
+                # W_block = torch.matmul(S_block, A_full_sparse.to_dense() if A_full_sparse.is_sparse else A_full_sparse)
                 # Wait, A_full_sparse.to_dense() is 18K x 123K ~ 9GB. Might OOM.
                 # We should use sparse mm if possible.
                 # torch.sparse.mm(sparse, dense) -> dense.

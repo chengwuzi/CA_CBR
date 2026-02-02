@@ -100,7 +100,18 @@ def main():
         # CAGCN Settings
         cagcn_type = conf.get("cagcn_type", "jc")
         trend_coeff = conf.get("trend_coeff", 1.0)
-        settings += [f"CAGCN_{cagcn_type}_{trend_coeff}"]
+        
+        trend_mix = conf.get("trend_mix", False)
+        if trend_mix:
+             trend_norm = conf.get("trend_norm", "row")
+             trend_topk = conf.get("trend_topk", 0)
+             tc_ub = conf.get("trend_coeff_ub", trend_coeff)
+             tc_ui = conf.get("trend_coeff_ui", trend_coeff)
+             tc_bi = conf.get("trend_coeff_bi", trend_coeff)
+             
+             settings += [f"Mix_{trend_norm}_K{trend_topk}_UB{tc_ub}_UI{tc_ui}_BI{tc_bi}"]
+        else:
+             settings += [f"CAGCN_{cagcn_type}_{trend_coeff}"]
 
         settings += ["Neg_%d" % (conf["neg_num"]), str(conf["batch_size_train"]), str(lr), str(l2_reg),
                      str(embedding_size)]

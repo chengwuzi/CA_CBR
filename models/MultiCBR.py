@@ -77,10 +77,43 @@ class MultiCBR(nn.Module):
             self.trend_ub = self.trend_ub.to(self.device)
             self.trend_ui = self.trend_ui.to(self.device)
             self.trend_bi = self.trend_bi.to(self.device)
+
+            # Normalize trends if mixed propagation is enabled or requested
+            if self.trend_norm == 'row':
+                 if self.trend_ub is not None: self.trend_ub = self.row_normalize_sparse(self.trend_ub)
+                 if self.trend_ui is not None: self.trend_ui = self.row_normalize_sparse(self.trend_ui)
+                 if self.trend_bi is not None: self.trend_bi = self.row_normalize_sparse(self.trend_bi)
+                 
+            # ===== DEBUG LOG (add) ===== 
+            if getattr(self, "trend_norm", None) == "row": 
+                print("[TrendNorm] row-normalize applied") 
+            # ===== DEBUG LOG (end) ===== 
+                 
         else:
             self.trend_ub = None
             self.trend_ui = None
             self.trend_bi = None
+            
+        # ===== DEBUG LOG (add) ===== 
+        def _sp_info(t, name): 
+            if t is None: 
+                return f"{name}=None" 
+            tt = t.coalesce() 
+            return f"{name}: shape={tuple(tt.shape)} nnz={tt._nnz()} device={tt.device} dtype={tt.dtype}" 
+        
+        print("[TrendLoad]", 
+              _sp_info(self.trend_ub, "trend_ub"), 
+              _sp_info(self.trend_ui, "trend_ui"), 
+              _sp_info(self.trend_bi, "trend_bi")) 
+        print("[MixCfg]", 
+              "trend_mix=", conf.get("trend_mix", False), 
+              "trend_norm=", conf.get("trend_norm", "row"), 
+              "trend_mix_layers=", conf.get("trend_mix_layers", -1), 
+              "coeff_ub/ui/bi=", 
+              conf.get("trend_coeff_ub", conf.get("trend_coeff", 1.0)), 
+              conf.get("trend_coeff_ui", conf.get("trend_coeff", 1.0)), 
+              conf.get("trend_coeff_bi", conf.get("trend_coeff", 1.0))) 
+        # ===== DEBUG LOG (end) =====
 
         # generate the graph without any dropouts for testing
         self.UB_propagation_graph_ori = self.get_propagation_graph(self.ub_graph)
@@ -185,7 +218,83 @@ class MultiCBR(nn.Module):
         return to_tensor(bipartite_graph).to(device)
 
 
+    def row_normalize_sparse(self, t):
+        # t: sparse tensor
+        t = t.coalesce()
+        indices = t.indices()
+        values = t.values()
+        row = indices[0]
+        num_rows = t.size(0)
+        
+        # Calculate row sum
+        # Using scatter_add logic manually if no torch_scatter
+        row_sum = torch.zeros(num_rows, device=t.device)
+        row_sum.index_add_(0, row, values)
+        
+        # Inverse row sum
+        inv = 1.0 / (row_sum + 1e-12)
+        
+        # Apply normalization
+        new_values = values * inv[row]
+        
+        return torch.sparse_coo_tensor(indices, new_values, t.size()).coalesce()
+
+
+    def propagate_mixed(self, A, T, features, num_layers, alpha, mask=None, mix_layers=-1):
+        # A: Augmentated Graph (or Original)
+        # T: Normalized Trend Graph
+        
+        if T is not None and features.device != T.device:
+             T = T.to(features.device)
+             
+        # Check shapes if T is provided
+        if T is not None:
+             assert A.size() == T.size(), f"Graph shape mismatch: A {A.size()} vs T {T.size()}"
+
+        all_features = [features]
+        H = features
+        
+        for l in range(num_layers):
+            # 1. Original Propagation
+            H_A = torch.spmm(A, H)
+            
+            # Apply Augmentation to H_A if needed (already done in A construction usually)
+            # But wait, propagate() does augmentation inside loop for MD/Noise
+            if self.conf["aug_type"] == "MD" and mask is not None:
+                # Mask logic for Message Dropout
+                H_A = mask(H_A)
+            elif self.conf["aug_type"] == "Noise" and mask is not None:
+                # Noise logic
+                # random_noise = torch.rand_like(H_A).to(self.device)
+                random_noise = torch.rand(H_A.size(), device=self.device) # Avoid explicit like if possible, but shape is same
+                eps = mask # mask is eps here
+                H_A += torch.sign(H_A) * F.normalize(random_noise, dim=-1) * eps
+
+            # 2. Mixed Propagation
+            if self.trend_mix and T is not None and (mix_layers == -1 or l < mix_layers):
+                H_T = torch.spmm(T, H)
+                H = (1 - alpha) * H_A + alpha * H_T
+            else:
+                H = H_A
+            
+            H = F.normalize(H, p=2, dim=1)
+            all_features.append(H)
+            
+        all_features = torch.stack(all_features, 1)
+        # Apply layer coefficients? self.propagate does it at end
+        # But layer_coef is passed to propagate...
+        # Let's handle it outside or pass it in? 
+        # propagate() does: all_features * layer_coef -> sum
+        
+        return all_features
+
+
     def propagate(self, graph, A_feature, B_feature, graph_type, layer_coef, test):
+        # Legacy propagate modified to use propagate_mixed logic if trend_mix is False
+        # But actually we want to replace calls to propagate() with calls to a unified function
+        # Let's keep propagate() for legacy support or non-mixed calls
+        
+        # ... (Existing propagate code) ...
         features = torch.cat((A_feature, B_feature), 0)
         all_features = [features]
 
@@ -254,46 +363,95 @@ class MultiCBR(nn.Module):
 
 
     def get_multi_modal_representations(self, test=False):
+        if not hasattr(self, "_mix_logged"): 
+            self._mix_logged = False 
+            
+        # Helper to get mask/eps for augmentation
+        def get_aug_mask(graph_type):
+            if test: return None
+            if self.conf["aug_type"] == "MD":
+                return self.mess_dropout_dict[graph_type]
+            elif self.conf["aug_type"] == "Noise":
+                return self.eps_dict[graph_type]
+            return None
+
         #  =============================  UB graph propagation  =============================
         if test:
-            UB_users_feature, UB_bundles_feature = self.propagate(self.UB_propagation_graph_ori, self.users_feature, self.bundles_feature, "UB", self.UB_layer_coefs, test)
+            A_ub = self.UB_propagation_graph_ori
         else:
-            UB_users_feature, UB_bundles_feature = self.propagate(self.UB_propagation_graph, self.users_feature, self.bundles_feature, "UB", self.UB_layer_coefs, test)
-        
-        # CAGCN Plugin: UB Trend
-        if self.trend_ub is not None:
-            UB_trend_u, UB_trend_b = self.propagate_trend(self.trend_ub, self.users_feature, self.bundles_feature)
-            UB_users_feature = UB_users_feature + self.trend_coeff * UB_trend_u
-            UB_bundles_feature = UB_bundles_feature + self.trend_coeff * UB_trend_b
+            A_ub = self.UB_propagation_graph
+            
+        if self.trend_mix:
+            # ===== DEBUG LOG (add) ===== 
+            if self.trend_mix and (not self._mix_logged): 
+                print("[MixRun] Mixed propagation is ACTIVE (first time).", 
+                      "mix_layers=", self.trend_mix_layers, 
+                      "alpha_ub/ui/bi=", self.trend_coeff_ub, self.trend_coeff_ui, self.trend_coeff_bi) 
+                self._mix_logged = True 
+            # ===== DEBUG LOG (end) ===== 
+            
+            # Mixed Propagation
+            features_ub = torch.cat((self.users_feature, self.bundles_feature), 0)
+            all_feats = self.propagate_mixed(A_ub, self.trend_ub, features_ub, self.num_layers, self.trend_coeff_ub, get_aug_mask("UB"), self.trend_mix_layers)
+            all_feats = all_feats * self.UB_layer_coefs
+            all_feats = torch.sum(all_feats, dim=1)
+            UB_users_feature, UB_bundles_feature = torch.split(all_feats, (self.users_feature.shape[0], self.bundles_feature.shape[0]), 0)
+        else:
+            # Legacy Propagation
+            UB_users_feature, UB_bundles_feature = self.propagate(A_ub, self.users_feature, self.bundles_feature, "UB", self.UB_layer_coefs, test)
+            # Legacy Residual Plugin
+            if self.trend_ub is not None:
+                UB_trend_u, UB_trend_b = self.propagate_trend(self.trend_ub, self.users_feature, self.bundles_feature)
+                UB_users_feature = UB_users_feature + self.trend_coeff * UB_trend_u
+                UB_bundles_feature = UB_bundles_feature + self.trend_coeff * UB_trend_b
 
         #  =============================  UI graph propagation  =============================
         if test:
-            UI_users_feature, UI_items_feature = self.propagate(self.UI_propagation_graph_ori, self.users_feature, self.items_feature, "UI", self.UI_layer_coefs, test)
-            UI_bundles_feature = self.aggregate(self.BI_aggregation_graph_ori, UI_items_feature, "BI", test)
+            A_ui = self.UI_propagation_graph_ori
+            Agg_ui = self.BI_aggregation_graph_ori
         else:
-            UI_users_feature, UI_items_feature = self.propagate(self.UI_propagation_graph, self.users_feature, self.items_feature, "UI", self.UI_layer_coefs, test)
-            UI_bundles_feature = self.aggregate(self.BI_aggregation_graph, UI_items_feature, "BI", test)
+            A_ui = self.UI_propagation_graph
+            Agg_ui = self.BI_aggregation_graph
+
+        if self.trend_mix:
+             features_ui = torch.cat((self.users_feature, self.items_feature), 0)
+             all_feats = self.propagate_mixed(A_ui, self.trend_ui, features_ui, self.num_layers, self.trend_coeff_ui, get_aug_mask("UI"), self.trend_mix_layers)
+             all_feats = all_feats * self.UI_layer_coefs
+             all_feats = torch.sum(all_feats, dim=1)
+             UI_users_feature, UI_items_feature = torch.split(all_feats, (self.users_feature.shape[0], self.items_feature.shape[0]), 0)
+             UI_bundles_feature = self.aggregate(Agg_ui, UI_items_feature, "BI", test)
+        else:
+            UI_users_feature, UI_items_feature = self.propagate(A_ui, self.users_feature, self.items_feature, "UI", self.UI_layer_coefs, test)
+            UI_bundles_feature = self.aggregate(Agg_ui, UI_items_feature, "BI", test)
             
-        # CAGCN Plugin: UI Trend (Only add to users, items are intermediate)
-        if self.trend_ui is not None:
-            UI_trend_u, UI_trend_i = self.propagate_trend(self.trend_ui, self.users_feature, self.items_feature)
-            UI_users_feature = UI_users_feature + self.trend_coeff * UI_trend_u
-            # We don't propagate trend to UI_bundles_feature directly as it comes from aggregation
-            # But we could trend-enhance the items before aggregation?
-            # Let's keep it simple: Only enhance final node representations
+            # Legacy Residual Plugin
+            if self.trend_ui is not None:
+                UI_trend_u, UI_trend_i = self.propagate_trend(self.trend_ui, self.users_feature, self.items_feature)
+                UI_users_feature = UI_users_feature + self.trend_coeff * UI_trend_u
 
         #  =============================  BI graph propagation  =============================
         if test:
-            BI_bundles_feature, BI_items_feature = self.propagate(self.BI_propagation_graph_ori, self.bundles_feature, self.items_feature, "BI", self.BI_layer_coefs, test)
-            BI_users_feature = self.aggregate(self.UI_aggregation_graph_ori, BI_items_feature, "UI", test)
+            A_bi = self.BI_propagation_graph_ori
+            Agg_bi = self.UI_aggregation_graph_ori
         else:
-            BI_bundles_feature, BI_items_feature = self.propagate(self.BI_propagation_graph, self.bundles_feature, self.items_feature, "BI", self.BI_layer_coefs, test)
-            BI_users_feature = self.aggregate(self.UI_aggregation_graph, BI_items_feature, "UI", test)
+            A_bi = self.BI_propagation_graph
+            Agg_bi = self.UI_aggregation_graph
             
-        # CAGCN Plugin: BI Trend
-        if self.trend_bi is not None:
-            BI_trend_b, BI_trend_i = self.propagate_trend(self.trend_bi, self.bundles_feature, self.items_feature)
-            BI_bundles_feature = BI_bundles_feature + self.trend_coeff * BI_trend_b
+        if self.trend_mix:
+             features_bi = torch.cat((self.bundles_feature, self.items_feature), 0)
+             all_feats = self.propagate_mixed(A_bi, self.trend_bi, features_bi, self.num_layers, self.trend_coeff_bi, get_aug_mask("BI"), self.trend_mix_layers)
+             all_feats = all_feats * self.BI_layer_coefs
+             all_feats = torch.sum(all_feats, dim=1)
+             BI_bundles_feature, BI_items_feature = torch.split(all_feats, (self.bundles_feature.shape[0], self.items_feature.shape[0]), 0)
+             BI_users_feature = self.aggregate(Agg_bi, BI_items_feature, "UI", test)
+        else:
+            BI_bundles_feature, BI_items_feature = self.propagate(A_bi, self.bundles_feature, self.items_feature, "BI", self.BI_layer_coefs, test)
+            BI_users_feature = self.aggregate(Agg_bi, BI_items_feature, "UI", test)
+            
+            # Legacy Residual Plugin
+            if self.trend_bi is not None:
+                BI_trend_b, BI_trend_i = self.propagate_trend(self.trend_bi, self.bundles_feature, self.items_feature)
+                BI_bundles_feature = BI_bundles_feature + self.trend_coeff * BI_trend_b
 
         users_feature = [UB_users_feature, UI_users_feature, BI_users_feature]
         bundles_feature = [UB_bundles_feature, UI_bundles_feature, BI_bundles_feature]
