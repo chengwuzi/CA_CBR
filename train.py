@@ -109,7 +109,11 @@ def main():
              tc_ui = conf.get("trend_coeff_ui", trend_coeff)
              tc_bi = conf.get("trend_coeff_bi", trend_coeff)
              
-             settings += [f"Mix_{trend_norm}_K{trend_topk}_UB{tc_ub}_UI{tc_ui}_BI{tc_bi}"]
+             mix_ub = conf.get("trend_mix_ub", conf.get("trend_mix", False))
+             mix_ui = conf.get("trend_mix_ui", conf.get("trend_mix", False))
+             mix_bi = conf.get("trend_mix_bi", conf.get("trend_mix", False))
+             
+             settings += [f"Mix[{int(mix_ub)}{int(mix_ui)}{int(mix_bi)}]_{trend_norm}_K{trend_topk}_UB{tc_ub}_UI{tc_ui}_BI{tc_bi}"]
         else:
              settings += [f"CAGCN_{cagcn_type}_{trend_coeff}"]
 

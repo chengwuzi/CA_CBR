@@ -73,6 +73,11 @@ class MultiCBR(nn.Module):
         self.trend_coeff_ui = conf.get("trend_coeff_ui", self.trend_coeff)
         self.trend_coeff_bi = conf.get("trend_coeff_bi", self.trend_coeff)
 
+        # view-wise switches (default: follow global trend_mix)
+        self.trend_mix_ub = conf.get("trend_mix_ub", conf.get("trend_mix", False))
+        self.trend_mix_ui = conf.get("trend_mix_ui", conf.get("trend_mix", False))
+        self.trend_mix_bi = conf.get("trend_mix_bi", conf.get("trend_mix", False))
+
         self.init_emb()
         self.init_fusion_weights()
 
@@ -117,6 +122,7 @@ class MultiCBR(nn.Module):
               "trend_mix=", conf.get("trend_mix", False), 
               "trend_norm=", conf.get("trend_norm", "row"), 
               "trend_mix_layers=", conf.get("trend_mix_layers", -1), 
+              "mix_ub/ui/bi=", self.trend_mix_ub, self.trend_mix_ui, self.trend_mix_bi, 
               "coeff_ub/ui/bi=", 
               conf.get("trend_coeff_ub", conf.get("trend_coeff", 1.0)), 
               conf.get("trend_coeff_ui", conf.get("trend_coeff", 1.0)), 
@@ -372,7 +378,7 @@ class MultiCBR(nn.Module):
 
     def get_multi_modal_representations(self, test=False):
         if not hasattr(self, "_mix_logged"): 
-            self._mix_logged = False 
+            self._mix_logged = {"UB": False, "UI": False, "BI": False}
             
         # Helper to get mask/eps for augmentation
         def get_aug_mask(graph_type):
@@ -389,13 +395,13 @@ class MultiCBR(nn.Module):
         else:
             A_ub = self.UB_propagation_graph
             
-        if self.trend_mix:
+        if self.trend_mix and self.trend_mix_ub:
             # ===== DEBUG LOG (add) ===== 
-            if self.trend_mix and (not self._mix_logged): 
-                print("[MixRun] Mixed propagation is ACTIVE (first time).", 
+            if not self._mix_logged["UB"]:
+                print("[MixRun][UB] ACTIVE", 
                       "mix_layers=", self.trend_mix_layers, 
-                      "alpha_ub/ui/bi=", self.trend_coeff_ub, self.trend_coeff_ui, self.trend_coeff_bi) 
-                self._mix_logged = True 
+                      "alpha=", self.trend_coeff_ub) 
+                self._mix_logged["UB"] = True
             # ===== DEBUG LOG (end) ===== 
             
             # Mixed Propagation
@@ -421,7 +427,13 @@ class MultiCBR(nn.Module):
             A_ui = self.UI_propagation_graph
             Agg_ui = self.BI_aggregation_graph
 
-        if self.trend_mix:
+        if self.trend_mix and self.trend_mix_ui:
+             if not self._mix_logged["UI"]:
+                 print("[MixRun][UI] ACTIVE", 
+                       "mix_layers=", self.trend_mix_layers, 
+                       "alpha=", self.trend_coeff_ui) 
+                 self._mix_logged["UI"] = True
+                 
              features_ui = torch.cat((self.users_feature, self.items_feature), 0)
              all_feats = self.propagate_mixed(A_ui, self.trend_ui, features_ui, self.num_layers, self.trend_coeff_ui, get_aug_mask("UI"), self.trend_mix_layers)
              all_feats = all_feats * self.UI_layer_coefs
@@ -445,7 +457,13 @@ class MultiCBR(nn.Module):
             A_bi = self.BI_propagation_graph
             Agg_bi = self.UI_aggregation_graph
             
-        if self.trend_mix:
+        if self.trend_mix and self.trend_mix_bi:
+             if not self._mix_logged["BI"]:
+                 print("[MixRun][BI] ACTIVE", 
+                       "mix_layers=", self.trend_mix_layers, 
+                       "alpha=", self.trend_coeff_bi) 
+                 self._mix_logged["BI"] = True
+                 
              features_bi = torch.cat((self.bundles_feature, self.items_feature), 0)
              all_feats = self.propagate_mixed(A_bi, self.trend_bi, features_bi, self.num_layers, self.trend_coeff_bi, get_aug_mask("BI"), self.trend_mix_layers)
              all_feats = all_feats * self.BI_layer_coefs

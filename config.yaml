@@ -50,6 +50,9 @@ NetEase:
   - 80
   trend_coeff: 0.06
   trend_mix: true
+  trend_mix_ub: false
+  trend_mix_ui: true
+  trend_mix_bi: false
   trend_norm: row
   trend_topk: 0
   trend_coeff_ub: 0.06
